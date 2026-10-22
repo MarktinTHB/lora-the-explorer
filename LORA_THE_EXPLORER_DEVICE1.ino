@@ -164,9 +164,12 @@ struct RemoteDevice {
   bool online = false;
   bool asleep = false;
   bool gpsValid = false;
+  bool headingValid = false;
   double lat = 0.0;
   double lon = 0.0;
+  float remoteHeading = 0.0f;
   unsigned long lastSeen = 0;
+  unsigned long locationUpdatedAt = 0;
   uint8_t heartbeatCount = 0;
 };
 
@@ -211,9 +214,18 @@ bool cachedRemoteAsleep[4] = {false, false, false, false};
 String pingMessage = "";
 unsigned long pingMessageTime = 0;
 #define PING_MESSAGE_TIME 5000UL
+#define PING_ACK_TIMEOUT 3000UL
+uint16_t pingSequence = 0;
+bool pingPending = false;
+int pendingPingTarget = 0;
+uint16_t pendingPingSequence = 0;
+unsigned long pendingPingStartedAt = 0;
+bool receivedPingSequenceValid[4][4] = {};
+uint16_t receivedPingSequences[4][4] = {};
+uint8_t receivedPingSequenceNext[4] = {0, 0, 0, 0};
+unsigned long lastDistanceLog[4] = {0, 0, 0, 0};
 
-// Calculate the LoRa Time-on-Air for the Main Menu PING packet.
-// This is transmission airtime, not round-trip latency and does not use ACK.
+// Optional LoRa airtime diagnostic; this is not measured ping latency.
 float estimateLoRaToAMs(uint8_t payloadBytes) {
   const float bandwidth = 125000.0f;
   const int sf = 7;
@@ -301,6 +313,7 @@ void sendStateResponse(int targetId);
 void sendSleepLocationReport();
 void setSleepMode(bool enabled);
 void sendPing(int targetId);
+void checkPingTimeout();
 void receiveLoRa();
 void handlePacketTest(const String &packet);
 void runPacketTest();
@@ -314,6 +327,15 @@ int daysInMonth(int month, int year);
 
 float bearingToPeer(double peerLat, double peerLon);
 float distanceToPeer(double peerLat, double peerLon);
+float normalizeBearing(float degrees);
+bool validCoordinates(double lat, double lon);
+bool localLocationValid();
+bool remoteLocationFresh(int deviceId);
+void updateRemoteLocation(int deviceId, bool gpsValid, double lat, double lon,
+                          bool headingValid, float remoteHeading);
+void logPeerMeasurement(int deviceId, float bearing, float distance);
+int relativeBearingDegrees(double peerLat, double peerLon);
+bool parsePingSequence(const String &text, uint16_t &sequence);
 void drawPeerDot(int deviceId, double peerLat, double peerLon, uint16_t color);
 
 String shortDirection(float degrees);
@@ -522,6 +544,7 @@ String lastPeerDistanceDisplay[4] = {"", "", "", ""};
 float lastPeerHeading = -999.0f;
 String lastPeerDirection = "";
 bool lastPeerGpsFix = false;
+bool lastPeerGpsFresh[4] = {false, false, false, false};
 bool lastPeerMagFound = false;
 float lastPeer1Lat = 0.0f;
 float lastPeer1Lon = 0.0f;
@@ -550,6 +573,12 @@ struct PeerDotCache {
   uint16_t color = BLACK;
 };
 PeerDotCache lastPeerDot[4];
+struct CardinalLabelCache {
+  bool valid = false;
+  int x = 0;
+  int y = 0;
+};
+CardinalLabelCache lastCardinalLabel[4];
 
 unsigned long lastMainDynamic = 0;
 unsigned long lastPeerDynamic = 0;
@@ -586,10 +615,13 @@ void updateGPS() {
     gps.encode(gpsSerial.read());
   }
 
-  if (gps.location.isValid()) {
+  if (gps.location.isValid() && gps.location.age() <= 5000UL &&
+      validCoordinates(gps.location.lat(), gps.location.lng())) {
     latitude = gps.location.lat();
     longitude = gps.location.lng();
     gpsHasFix = true;
+  } else {
+    gpsHasFix = false;
   }
 
   if (gps.time.isValid()) {
@@ -603,6 +635,74 @@ void updateGPS() {
     gpsMonth = gps.date.month();
     gpsYear = gps.date.year();
   }
+}
+
+bool validCoordinates(double lat, double lon) {
+  return isfinite(lat) && isfinite(lon) && lat >= -90.0 && lat <= 90.0 &&
+         lon >= -180.0 && lon <= 180.0 && !(lat == 0.0 && lon == 0.0);
+}
+
+bool localLocationValid() {
+  return gpsHasFix && gps.location.isValid() && gps.location.age() <= 5000UL &&
+         validCoordinates(latitude, longitude);
+}
+
+bool remoteLocationFresh(int deviceId) {
+  if (deviceId < 1 || deviceId > 3 || deviceId == DEVICE_ID ||
+      !remote[deviceId].online || !remote[deviceId].gpsValid ||
+      remote[deviceId].locationUpdatedAt == 0) return false;
+  unsigned long maxAge = remote[deviceId].asleep ? 360000UL : 15000UL;
+  return millis() - remote[deviceId].locationUpdatedAt <= maxAge;
+}
+
+void updateRemoteLocation(int deviceId, bool hasFix, double lat, double lon,
+                          bool hasHeading, float peerHeading) {
+  bool coordinatesOk = hasFix && validCoordinates(lat, lon);
+  remote[deviceId].gpsValid = coordinatesOk;
+  if (coordinatesOk) {
+    remote[deviceId].lat = lat;
+    remote[deviceId].lon = lon;
+    remote[deviceId].locationUpdatedAt = millis();
+  }
+  remote[deviceId].headingValid = hasHeading && isfinite(peerHeading) &&
+                                  peerHeading >= 0.0f && peerHeading < 360.0f;
+  if (remote[deviceId].headingValid) remote[deviceId].remoteHeading = peerHeading;
+}
+
+float normalizeBearing(float degrees) {
+  while (degrees < 0.0f) degrees += 360.0f;
+  while (degrees >= 360.0f) degrees -= 360.0f;
+  return degrees;
+}
+
+void logPeerMeasurement(int deviceId, float bearing, float distance) {
+  unsigned long now = millis();
+  if (now - lastDistanceLog[deviceId] < 5000UL) return;
+  lastDistanceLog[deviceId] = now;
+  Serial.printf("GPS DIST local=%d %.6f,%.6f fix=%d peer=%d %.6f,%.6f fix=%d age_ms=%lu bearing_deg=%.1f distance_m=%.1f\n",
+                DEVICE_ID, latitude, longitude, localLocationValid(), deviceId,
+                remote[deviceId].lat, remote[deviceId].lon,
+                remoteLocationFresh(deviceId),
+                now - remote[deviceId].locationUpdatedAt, bearing, distance);
+}
+
+int relativeBearingDegrees(double peerLat, double peerLon) {
+  int degrees = (int)roundf(normalizeBearing(bearingToPeer(peerLat, peerLon) - heading));
+  return degrees >= 360 ? 0 : degrees;
+}
+
+bool parsePingSequence(const String &text, uint16_t &sequence) {
+  if (text.length() == 0 || text.length() > 5) return false;
+  uint32_t value = 0;
+  for (unsigned int i = 0; i < text.length(); ++i) {
+    char digit = text.charAt(i);
+    if (digit < '0' || digit > '9') return false;
+    value = value * 10UL + (uint32_t)(digit - '0');
+    if (value > 65535UL) return false;
+  }
+  if (value == 0) return false;
+  sequence = (uint16_t)value;
+  return true;
 }
 
 // =====================================================
@@ -798,7 +898,7 @@ float calculateHeading() {
   float calibratedX = ((float)magX - magCal[0]) * magCal[2];
   float calibratedY = ((float)magY - magCal[1]) * magCal[3];
 
-  float angle = atan2(calibratedY, calibratedX) * 180.0f / PI;
+  float angle = atan2(calibratedX, calibratedY) * 180.0f / PI;
   angle += MAG_DECLINATION;
 
   while (angle < 0.0f) angle += 360.0f;
@@ -968,7 +1068,7 @@ void sendHeartbeat() {
   packet = "HB,";
   packet += String(DEVICE_ID);
   packet += ",";
-  packet += String(gpsHasFix ? 1 : 0);
+  packet += String(localLocationValid() ? 1 : 0);
   packet += ",";
   packet += String(latitude, 6);
   packet += ",";
@@ -1003,6 +1103,10 @@ void sendHeartbeat() {
   } else {
     packet += "-1,-1,-1,-1,-1,-1";
   }
+  packet += ",";
+  packet += String(magnetometerPresent ? 1 : 0);
+  packet += ",";
+  packet += magnetometerPresent ? String(heading, 1) : String(-1);
 
   // Responsive build: send ONE heartbeat, then immediately return to RX.
   // The longer interval leaves substantially more time for incoming packets.
@@ -1047,11 +1151,15 @@ void sendStateResponse(int targetId) {
   String packet = "STATE," + String(DEVICE_ID) + "," + String(targetId) + ",";
   packet += String(sleepMode ? 1 : 0);
   packet += ",";
-  packet += String(gpsHasFix ? 1 : 0);
+  packet += String(localLocationValid() ? 1 : 0);
   packet += ",";
   packet += String(latitude, 6);
   packet += ",";
   packet += String(longitude, 6);
+  packet += ",";
+  packet += String(magnetometerPresent ? 1 : 0);
+  packet += ",";
+  packet += magnetometerPresent ? String(heading, 1) : String(-1);
 
   LoRa.beginPacket();
   LoRa.print(packet);
@@ -1069,36 +1177,39 @@ void sendStateResponse(int targetId) {
 // =====================================================
 
 void sendPing(int targetId) {
+  if (targetId < 0 || targetId > 3 || targetId == DEVICE_ID) return;
+  if (pingPending) {
+    pingMessage = "PING IN PROGRESS";
+    pingMessageTime = millis();
+    updateMainMenuDynamic(true);
+    return;
+  }
+
   digitalWrite(TFT_CS, HIGH);
   digitalWrite(TOUCH_CS, HIGH);
 
   radioSleeping = false;
   LoRa.idle();
 
-  // targetId == 0 means broadcast to all devices.
-  // Otherwise only that specific device should accept the ping.
-  // Compact PING packet: P,<sender>,<target>
-  // At SF7 / 125 kHz this keeps the airtime around 31.0 ms.
-  String packet = "P," + String(DEVICE_ID) + "," + String(targetId);
-  const float latencyMs = estimateLoRaToAMs((uint8_t)packet.length());
+  uint16_t sequence = ++pingSequence;
+  if (sequence == 0) sequence = ++pingSequence;
+  String packet = "P," + String(DEVICE_ID) + "," + String(targetId) + "," + String(sequence);
 
-  // Show the result immediately on the sender before the radio transmits.
   if (targetId == 0) {
-    pingMessage =
-      "You pinged everyone! (" + String(latencyMs, 1) + " ms)";
+    pingMessage = "BROADCAST SENT; RTT N/A";
   } else {
-    pingMessage =
-      "You pinged Lora #" + String(targetId) + "! (" +
-      String(latencyMs, 1) + " ms)";
+    pingPending = true;
+    pendingPingTarget = targetId;
+    pendingPingSequence = sequence;
+    pingMessage = "PING LORA #" + String(targetId) + " WAITING...";
   }
   pingMessageTime = millis();
   if (currentScreen == MAIN_MENU) {
     updateMainMenuDynamic(true);
   }
 
-  // Responsive build: transmit the compact Ping ONCE.
-  // The packet is small (~31 ms ToA at the current LoRa settings),
-  // so a single transmission gives the fastest response to the other unit.
+  // One radio transmission per user action. Only targeted pings expect an ACK.
+  if (targetId != 0) pendingPingStartedAt = millis();
   LoRa.beginPacket();
   LoRa.print(packet);
   LoRa.endPacket();
@@ -1109,6 +1220,32 @@ void sendPing(int targetId) {
   } else {
     LoRa.receive();
   }
+}
+
+void checkPingTimeout() {
+  if (!pingPending || millis() - pendingPingStartedAt < PING_ACK_TIMEOUT) return;
+  pingPending = false;
+  pingMessage = "PING LORA #" + String(pendingPingTarget) + " TIMEOUT";
+  pingMessageTime = millis();
+  if (currentScreen == MAIN_MENU) updateMainMenuDynamic(true);
+}
+
+void sendPingAck(int requesterId, int targetId, uint16_t sequence) {
+  if (sleepMode || radioSleeping) return;
+  digitalWrite(TFT_CS, HIGH);
+  digitalWrite(TOUCH_CS, HIGH);
+  LoRa.idle();
+  LoRa.beginPacket();
+  LoRa.print("PA,");
+  LoRa.print(DEVICE_ID);
+  LoRa.print(",");
+  LoRa.print(requesterId);
+  LoRa.print(",");
+  LoRa.print(targetId);
+  LoRa.print(",");
+  LoRa.print(sequence);
+  LoRa.endPacket();
+  LoRa.receive();
 }
 
 // =====================================================
@@ -1139,11 +1276,11 @@ void receiveLoRa() {
   // HB,id,gpsFix,lat,lon,h,m,s,day,month,year
   // ---------------------------------------------------
   if (packet.startsWith("HB,")) {
-    String f[10];
+    String f[12];
     int startIndex = 3;
     int count = 0;
 
-    while (count < 10) {
+    while (count < 12) {
       int comma = packet.indexOf(',', startIndex);
       if (comma < 0) {
         f[count++] = packet.substring(startIndex);
@@ -1165,9 +1302,9 @@ void receiveLoRa() {
         cachedRemoteOnline[sender] = true;
         cachedRemoteAsleep[sender] = false;
 
-        remote[sender].gpsValid = (f[1].toInt() == 1);
-        remote[sender].lat = f[2].toDouble();
-        remote[sender].lon = f[3].toDouble();
+        updateRemoteLocation(sender, f[1].toInt() == 1, f[2].toDouble(),
+                 f[3].toDouble(), count >= 12 && f[10].toInt() == 1,
+                 count >= 12 ? f[11].toFloat() : -1.0f);
 
         int h = f[4].toInt();
         int mi = f[5].toInt();
@@ -1200,11 +1337,11 @@ void receiveLoRa() {
   // SLP,id,1,gpsFix,lat,lon
   // ---------------------------------------------------
   if (packet.startsWith("SLP,")) {
-    String f[5];
+    String f[7];
     int startIndex = 4;
     int count = 0;
 
-    while (count < 5) {
+    while (count < 7) {
       int comma = packet.indexOf(',', startIndex);
       if (comma < 0) {
         f[count++] = packet.substring(startIndex);
@@ -1225,9 +1362,9 @@ void receiveLoRa() {
         remote[sender].heartbeatCount = ONLINE_CONFIRM_PACKETS;
         cachedRemoteOnline[sender] = true;
         cachedRemoteAsleep[sender] = (enabled == 1);
-        remote[sender].gpsValid = (f[2].toInt() == 1);
-        remote[sender].lat = f[3].toDouble();
-        remote[sender].lon = f[4].toDouble();
+        updateRemoteLocation(sender, f[2].toInt() == 1, f[3].toDouble(),
+                 f[4].toDouble(), count >= 7 && f[5].toInt() == 1,
+                 count >= 7 ? f[6].toFloat() : -1.0f);
       }
     }
 
@@ -1257,11 +1394,11 @@ void receiveLoRa() {
   // STATE,sender,target,asleep,gpsValid,lat,lon
   // ---------------------------------------------------
   if (packet.startsWith("STATE,")) {
-    String f[6];
+    String f[8];
     int startIndex = 6;
     int count = 0;
 
-    while (count < 6) {
+    while (count < 8) {
       int comma = packet.indexOf(',', startIndex);
       if (comma < 0) {
         f[count++] = packet.substring(startIndex);
@@ -1285,9 +1422,9 @@ void receiveLoRa() {
         remote[sender].asleep = asleep;
         remote[sender].online = true;
         remote[sender].heartbeatCount = ONLINE_CONFIRM_PACKETS;
-        remote[sender].gpsValid = (f[3].toInt() == 1);
-        remote[sender].lat = f[4].toDouble();
-        remote[sender].lon = f[5].toDouble();
+        updateRemoteLocation(sender, f[3].toInt() == 1, f[4].toDouble(),
+                 f[5].toDouble(), count >= 8 && f[6].toInt() == 1,
+                 count >= 8 ? f[7].toFloat() : -1.0f);
 
         cachedRemoteOnline[sender] = true;
         cachedRemoteAsleep[sender] = asleep;
@@ -1299,57 +1436,67 @@ void receiveLoRa() {
   }
 
   // ---------------------------------------------------
-  // MAIN MENU PING
-  // P,sender,target
-  // target == 0 -> broadcast to everyone
-  // target == DEVICE_ID -> this device only
-  // Legacy PING,sender,target is also accepted.
+  // P,sender,target,sequence and PA,responder,requester,target,sequence
   // ---------------------------------------------------
-  if (packet.startsWith("P,") || packet.startsWith("PING,")) {
-    const bool compactFormat = packet.startsWith("P,");
-    const int prefixLen = compactFormat ? 2 : 5;
+  if (packet.startsWith("PA,")) {
+    int first = packet.indexOf(',', 3);
+    int second = first < 0 ? -1 : packet.indexOf(',', first + 1);
+    int third = second < 0 ? -1 : packet.indexOf(',', second + 1);
+    if (first > 3 && second > first && third > second &&
+      packet.indexOf(',', third + 1) < 0) {
+      int responder = packet.substring(3, first).toInt();
+      int requester = packet.substring(first + 1, second).toInt();
+      int target = packet.substring(second + 1, third).toInt();
+      uint16_t sequence = 0;
+      bool sequenceValid = parsePingSequence(packet.substring(third + 1), sequence);
+      if (sequenceValid && pingPending && millis() - pendingPingStartedAt < PING_ACK_TIMEOUT &&
+          requester == DEVICE_ID && target == pendingPingTarget &&
+          responder == pendingPingTarget && sequence == pendingPingSequence) {
+        unsigned long rtt = millis() - pendingPingStartedAt;
+        pingPending = false;
+        pingMessage = "PINGED LORA #" + String(responder) + " | RTT: " + String(rtt) + " ms";
+        pingMessageTime = millis();
+        Serial.printf("PING RTT target=%d seq=%u rtt_ms=%lu\n", responder, sequence, rtt);
+        if (currentScreen == MAIN_MENU) updateMainMenuDynamic(true);
+      }
+    }
+    LoRa.receive();
+    return;
+  }
 
-    int comma = packet.indexOf(',', prefixLen);
-    if (comma > prefixLen) {
-      int sender = packet.substring(prefixLen, comma).toInt();
-      int target = packet.substring(comma + 1).toInt();
-
-      const bool addressedToMe =
-        (target == 0 || target == DEVICE_ID);
-
-      if (sender >= 1 && sender <= 3 &&
-          sender != DEVICE_ID && addressedToMe) {
-
+  if (packet.startsWith("P,")) {
+    int first = packet.indexOf(',', 2);
+    int second = first < 0 ? -1 : packet.indexOf(',', first + 1);
+    if (first > 2 && second > first && packet.indexOf(',', second + 1) < 0) {
+      int sender = packet.substring(2, first).toInt();
+      int target = packet.substring(first + 1, second).toInt();
+      uint16_t sequence = 0;
+      bool sequenceValid = parsePingSequence(packet.substring(second + 1), sequence);
+      bool addressedToMe = target == 0 || target == DEVICE_ID;
+      bool duplicate = false;
+      if (sender >= 1 && sender <= 3) {
+        for (int i = 0; i < 4; ++i) {
+          if (receivedPingSequenceValid[sender][i] &&
+              receivedPingSequences[sender][i] == sequence) duplicate = true;
+        }
+      }
+      if (sender >= 1 && sender <= 3 && sender != DEVICE_ID &&
+          (target == 0 || (target >= 1 && target <= 3 && target != sender)) &&
+          addressedToMe && sequenceValid && !duplicate) {
+        uint8_t slot = receivedPingSequenceNext[sender];
+        receivedPingSequenceValid[sender][slot] = true;
+        receivedPingSequences[sender][slot] = sequence;
+        receivedPingSequenceNext[sender] = (slot + 1) % 4;
         remote[sender].lastSeen = millis();
         remote[sender].online = true;
+        remote[sender].asleep = false;
         cachedRemoteOnline[sender] = true;
-
-        // Rebuild the exact compact packet so the receiver computes the
-        // same LoRa Time-on-Air value shown by the sender.
-        String normalizedPacket =
-          "P," + String(sender) + "," + String(target);
-        const float latencyMs =
-          estimateLoRaToAMs((uint8_t)normalizedPacket.length());
-
-        if (target == 0) {
-          pingMessage =
-            "Lora #" + String(sender) +
-            " pinged everyone! (" +
-            String(latencyMs, 1) + " ms)";
-        } else {
-          pingMessage =
-            "Lora #" + String(sender) +
-            " pinged you! (" +
-            String(latencyMs, 1) + " ms)";
-        }
-
+        cachedRemoteAsleep[sender] = false;
+        pingMessage = "LORA #" + String(sender) +
+                      (target == 0 ? " PINGED EVERYONE" : " PINGED YOU");
         pingMessageTime = millis();
-
-        // Refresh the ping text immediately on the receiving device.
-        // No waiting for the periodic Main Menu update.
-        if (currentScreen == MAIN_MENU) {
-          updateMainMenuDynamic(true);
-        }
+        if (currentScreen == MAIN_MENU) updateMainMenuDynamic(true);
+        if (target != 0) sendPingAck(sender, target, sequence);
       }
     }
   }
@@ -1418,11 +1565,16 @@ void sendSleepLocationReport() {
   LoRa.print("SLP,");
   LoRa.print(DEVICE_ID);
   LoRa.print(",1,");
-  LoRa.print(gpsHasFix ? 1 : 0);
+  LoRa.print(localLocationValid() ? 1 : 0);
   LoRa.print(",");
   LoRa.print(latitude, 6);
   LoRa.print(",");
   LoRa.print(longitude, 6);
+  LoRa.print(",");
+  LoRa.print(magnetometerPresent ? 1 : 0);
+  LoRa.print(",");
+  if (magnetometerPresent) LoRa.print(heading, 1);
+  else LoRa.print(-1);
   LoRa.endPacket();
 
   // The communication radio now sleeps until the next 5-minute report.
@@ -1692,11 +1844,6 @@ void drawPeerStatic() {
   tft.setTextSize(2);
   tft.setTextColor(WHITE, BLACK);
 
-  tft.setCursor(115, 12);  tft.print("N");
-  tft.setCursor(225, 116); tft.print("E");
-  tft.setCursor(5, 116);   tft.print("W");
-  tft.setCursor(115, 218); tft.print("S");
-
   tft.drawCircle(PEER_CIRCLE_CENTER_X, PEER_CIRCLE_CENTER_Y,
                  PEER_CIRCLE_RADIUS, WHITE);
 
@@ -1720,16 +1867,19 @@ void drawPeerStatic() {
 
 void drawPeerLegendLine(int deviceId, int y) {
   uint16_t color = deviceColor(deviceId);
-
-  // Full message is centered as one unit together with its bullet.
-  String shown = "N/A";
-  if (gpsHasFix && remote[deviceId].online && remote[deviceId].gpsValid) {
-    shown = String((int)roundf(distanceToPeer(remote[deviceId].lat,
-                                              remote[deviceId].lon)));
-  }
-
-  String line = "LORA #" + String(deviceId) +
-                " is " + shown + " meters away!";
+  bool positionValid = localLocationValid() && remoteLocationFresh(deviceId);
+  String distanceText = positionValid
+    ? String((int)roundf(distanceToPeer(remote[deviceId].lat, remote[deviceId].lon))) + "m"
+    : String("N/A");
+  String bearingText = positionValid && magnetometerPresent
+    ? String(relativeBearingDegrees(remote[deviceId].lat, remote[deviceId].lon))
+    : String("--");
+  String remoteHeadingText = remote[deviceId].online && remote[deviceId].headingValid
+    ? shortDirection(remote[deviceId].remoteHeading) : String("--");
+  String status = !remote[deviceId].online ? "OFFLINE"
+    : (remote[deviceId].asleep ? "SLEEPING" : "ONLINE");
+  String line = "LORA #" + String(deviceId) + " " + distanceText +
+                " B:" + bearingText + " H:" + remoteHeadingText + " " + status;
 
   tft.setTextSize(1);
   tft.setTextColor(WHITE, BLACK);
@@ -1738,7 +1888,9 @@ void drawPeerLegendLine(int deviceId, int y) {
   uint16_t w, h;
   tft.getTextBounds(line.c_str(), 0, y, &x1, &y1, &w, &h);
 
-  tft.setTextColor(remote[deviceId].asleep ? YELLOW : WHITE, BLACK);
+  uint16_t statusColor = !remote[deviceId].online ? GRAY
+    : (remote[deviceId].asleep ? YELLOW : WHITE);
+  tft.setTextColor(statusColor, BLACK);
 
   const int bulletRadius = 3;
   const int gap = 5;
@@ -1770,7 +1922,7 @@ void drawPeerLocation() {
   for (int i = 0; i < 4; ++i) lastPeerDistanceDisplay[i] = "";
   lastPeerHeading = -999.0f;
   lastPeerDirection = "";
-  lastPeerGpsFix = !gpsHasFix;
+  lastPeerGpsFix = !localLocationValid();
   lastPeerMagFound = !magnetometerPresent;
   lastPeer1Lat = remote[1].lat;
   lastPeer1Lon = remote[1].lon;
@@ -1809,41 +1961,29 @@ void drawCardinalLetter(const char *letter, int x, int y, bool active) {
 }
 
 void updatePeerCardinals(bool force) {
-  if (!magnetometerPresent) {
-    for (int i = 0; i < 4; i++) {
-      // handled below by redrawing all four as white
+  if (!force) return;
+  const char *labels[4] = {"N", "E", "S", "W"};
+  const float bearings[4] = {0.0f, 90.0f, 180.0f, 270.0f};
+  float localHeading = magnetometerPresent ? heading : 0.0f;
+  for (int i = 0; i < 4; ++i) {
+    if (lastCardinalLabel[i].valid) {
+      tft.fillRect(lastCardinalLabel[i].x - 2, lastCardinalLabel[i].y - 2,
+                   24, 20, BLACK);
     }
   }
-
-  bool activeN = magnetometerPresent && cardinalActive("N", heading);
-  bool activeE = magnetometerPresent && cardinalActive("E", heading);
-  bool activeS = magnetometerPresent && cardinalActive("S", heading);
-  bool activeW = magnetometerPresent && cardinalActive("W", heading);
-
-  uint8_t mask = (activeN ? 1 : 0) | (activeE ? 2 : 0) | (activeS ? 4 : 0) | (activeW ? 8 : 0);
-
-  uint8_t lastMask = 0xFF;
-  if (!force) {
-    // Reconstruct previous mask from lastPeerDirection.
-    float oldHeading = lastPeerHeading;
-    if (oldHeading >= 0.0f) {
-      if (magnetometerPresent) {
-        bool n = cardinalActive("N", oldHeading);
-        bool e = cardinalActive("E", oldHeading);
-        bool s = cardinalActive("S", oldHeading);
-        bool w = cardinalActive("W", oldHeading);
-        lastMask = (n ? 1 : 0) | (e ? 2 : 0) | (s ? 4 : 0) | (w ? 8 : 0);
-      } else {
-        lastMask = 0;
-      }
-    }
-  }
-
-  if (force || mask != lastMask || magnetometerPresent != lastPeerMagFound) {
-    drawCardinalLetter("N", 115, 12, activeN);
-    drawCardinalLetter("E", 225, 116, activeE);
-    drawCardinalLetter("S", 115, 218, activeS);
-    drawCardinalLetter("W", 5, 116, activeW);
+  tft.drawCircle(PEER_CIRCLE_CENTER_X, PEER_CIRCLE_CENTER_Y,
+                 PEER_CIRCLE_RADIUS, WHITE);
+  for (int i = 0; i < 4; ++i) {
+    float relative = normalizeBearing(bearings[i] - localHeading) * PI / 180.0f;
+    int centerX = PEER_CIRCLE_CENTER_X + (int)roundf(sinf(relative) * (PEER_CIRCLE_RADIUS + 13));
+    int centerY = PEER_CIRCLE_CENTER_Y - (int)roundf(cosf(relative) * (PEER_CIRCLE_RADIUS + 13));
+    int x = centerX - 6;
+    int y = centerY - 8;
+    drawCardinalLetter(labels[i], x, y,
+                       magnetometerPresent && cardinalActive(labels[i], heading));
+    lastCardinalLabel[i].x = x;
+    lastCardinalLabel[i].y = y;
+    lastCardinalLabel[i].valid = true;
   }
 }
 
@@ -1854,10 +1994,13 @@ void erasePeerDot(int id) {
 }
 
 void drawPeerDot(int deviceId, double peerLat, double peerLon, uint16_t color) {
-  if (!gpsHasFix) return;
+  if (!localLocationValid() || !magnetometerPresent ||
+      !validCoordinates(peerLat, peerLon)) return;
 
   float distance = distanceToPeer(peerLat, peerLon);
-  float bearing = bearingToPeer(peerLat, peerLon);
+  float geographicBearing = normalizeBearing(bearingToPeer(peerLat, peerLon));
+  float bearing = normalizeBearing(geographicBearing - heading);
+  logPeerMeasurement(deviceId, geographicBearing, distance);
 
   // Fixed 100 m display scale. Closer points sit closer to the center;
   // farther points are capped at the inside of the ring.
@@ -1898,7 +2041,7 @@ void redrawPeerDynamicObjects() {
   // Remote peers.
   for (int i = 1; i <= 3; i++) {
     if (i == DEVICE_ID) continue;
-    if (remote[i].online && remote[i].gpsValid && gpsHasFix) {
+    if (remoteLocationFresh(i) && localLocationValid() && magnetometerPresent) {
       drawPeerDot(i, remote[i].lat, remote[i].lon, deviceColor(i));
     }
   }
@@ -1955,13 +2098,18 @@ void updatePeerDynamicText(const String &locationText, bool locationOk,
     int id = ids[k];
     int y = ys[k];
 
-    String shown = "N/A";
-    if (gpsHasFix && remote[id].online && remote[id].gpsValid) {
-      shown = String((int)roundf(distanceToPeer(remote[id].lat, remote[id].lon)));
-    }
-
-    String line = "LORA #" + String(id) +
-                  " is " + shown + " meters away!";
+    String relativeBearing = localLocationValid() && remoteLocationFresh(id) && magnetometerPresent
+      ? String(relativeBearingDegrees(remote[id].lat, remote[id].lon))
+      : String("--");
+    String shown = localLocationValid() && remoteLocationFresh(id)
+      ? String((int)roundf(distanceToPeer(remote[id].lat, remote[id].lon))) + "m"
+      : String("N/A");
+    String remoteHeading = remote[id].online && remote[id].headingValid
+      ? shortDirection(remote[id].remoteHeading) : String("--");
+    String status = !remote[id].online ? "OFFLINE"
+      : (remote[id].asleep ? "SLEEPING" : "ONLINE");
+    String line = "LORA #" + String(id) + " " + shown + " B:" + relativeBearing +
+                  " H:" + remoteHeading + " " + status;
 
     String displayKey = line + (remote[id].asleep ? "|ASLEEP" : "|AWAKE");
 
@@ -1977,8 +2125,8 @@ void updatePeerLocationDynamic(bool force) {
   if (currentScreen != PEER_LOCATION_SCREEN) return;
 
   String locationText;
-  bool locationOk = gpsHasFix;
-  if (gpsHasFix) {
+  bool locationOk = localLocationValid();
+  if (locationOk) {
     char buf[40];
     snprintf(buf, sizeof(buf), "%.6f, %.6f", latitude, longitude);
     locationText = buf;
@@ -2006,7 +2154,10 @@ void updatePeerLocationDynamic(bool force) {
     directionShort != lastPeerDirection;
 
   bool peerGpsChanged = force ||
-    gpsHasFix != lastPeerGpsFix ||
+    localLocationValid() != lastPeerGpsFix ||
+    remoteLocationFresh(1) != lastPeerGpsFresh[1] ||
+    remoteLocationFresh(2) != lastPeerGpsFresh[2] ||
+    remoteLocationFresh(3) != lastPeerGpsFresh[3] ||
     (gpsHasFix && (fabs(latitude - lastPeerOwnLat) > 0.0000001 || fabs(longitude - lastPeerOwnLon) > 0.0000001)) ||
     remote[1].online != lastPeer1Online || remote[1].asleep != lastPeer1Asleep || remote[1].gpsValid != lastPeer1Gps ||
     fabs(remote[1].lat - lastPeer1Lat) > 0.0000001 ||
@@ -2025,7 +2176,7 @@ void updatePeerLocationDynamic(bool force) {
 
     lastPeerHeading = heading;
     lastPeerDirection = directionShort;
-    lastPeerGpsFix = gpsHasFix;
+    lastPeerGpsFix = localLocationValid();
     lastPeerMagFound = magnetometerPresent;
     lastPeer1Lat = remote[1].lat;
     lastPeer1Lon = remote[1].lon;
@@ -2044,6 +2195,7 @@ void updatePeerLocationDynamic(bool force) {
     lastPeer3Gps = remote[3].gpsValid;
     lastPeerOwnLat = latitude;
     lastPeerOwnLon = longitude;
+    for (int id = 1; id <= 3; ++id) lastPeerGpsFresh[id] = remoteLocationFresh(id);
   }
 
   updatePeerDynamicText(locationText, locationOk, headingText, headingOk);
@@ -2057,10 +2209,12 @@ void updatePeerLocationDynamic(bool force) {
 // =====================================================
 
 float distanceToPeer(double peerLat, double peerLon) {
+  if (!localLocationValid() || !validCoordinates(peerLat, peerLon)) return -1.0f;
   return (float)TinyGPSPlus::distanceBetween(latitude, longitude, peerLat, peerLon);
 }
 
 float bearingToPeer(double peerLat, double peerLon) {
+  if (!localLocationValid() || !validCoordinates(peerLat, peerLon)) return -1.0f;
   return (float)TinyGPSPlus::courseTo(latitude, longitude, peerLat, peerLon);
 }
 
@@ -2072,6 +2226,7 @@ float bearingToPeer(double peerLat, double peerLon) {
 
 void processTouch() {
   static bool wasTouched = false;
+  static unsigned long lastAcceptedTouch = 0;
   static unsigned long compassHoldStart = 0;
   bool nowTouched = touch.touched();
 
@@ -2100,9 +2255,10 @@ void processTouch() {
 
   // Ignore noise readings (0 or full-scale) instead of treating them as taps.
   if (p.x <= 50 || p.y <= 50 || p.x >= 4045 || p.y >= 4045) {
-    wasTouched = false;
     return;
   }
+  if (lastAcceptedTouch && millis() - lastAcceptedTouch < 180UL) return;
+  lastAcceptedTouch = millis();
 
   float sx = touchCal[0] * (float)p.x + touchCal[1] * (float)p.y + touchCal[2];
   float sy = touchCal[3] * (float)p.x + touchCal[4] * (float)p.y + touchCal[5];
@@ -2252,6 +2408,7 @@ void setup() {
   detectMagnetometer();
 
   randomSeed((uint32_t)micros() ^ (DEVICE_ID * 7919UL));
+  pingSequence = (uint16_t)random(1, 65536);
   // Default: Sleep Mode is OFF and remote status cache mirrors the
   // currently known states.
   sleepMode = false;
@@ -2613,7 +2770,7 @@ void serviceRadio() {
 
 // GPS distance to a peer in meters, or -1 when either side has no GPS fix.
 float packetTestDistance(int id) {
-  if (!gpsHasFix || !remote[id].gpsValid) return -1.0f;
+  if (!localLocationValid() || !remoteLocationFresh(id)) return -1.0f;
   return distanceToPeer(remote[id].lat, remote[id].lon);
 }
 
@@ -2817,6 +2974,7 @@ void loop() {
   updateGPS();
   updateCompass();
   receiveLoRa();
+  checkPingTimeout();
   updateDeviceStatus();
   processTouch();
 
