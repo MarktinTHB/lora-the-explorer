@@ -1,3 +1,7 @@
+// Current Version: v2.2.1.1
+// Fixed ping replies and messages, compass label/circle overlap, and the device list format.
+// Ping: "Sending..." blocks repeat taps, TIMEOUT message removed, receiver ACKs before redrawing, broadcast pings now get staggered ACKs, and sender/receiver show "You pinged Lora #N (X ms)" / "Lora #N pinged you (X ms)"; compass radius 80 -> 76 px with letters kept at the same 93 px orbit and a tight letter erase box; rows now read "LORA #N | D meters away! | DIR".
+
 #include <Arduino.h>
 #include <SPI.h>
 #include <Wire.h>
@@ -186,7 +190,10 @@ RemoteDevice remote[4];
 #define ONLINE_CONFIRM_PACKETS 2
 #define PEER_CIRCLE_CENTER_X 120
 #define PEER_CIRCLE_CENTER_Y 124
-#define PEER_CIRCLE_RADIUS 80
+// Reduced from 80 so the rotating N/E/S/W letters (kept on the same 93 px
+// orbit, see PEER_CARDINAL_ORBIT) never touch the circle outline.
+#define PEER_CIRCLE_RADIUS 76
+#define PEER_CARDINAL_ORBIT (PEER_CIRCLE_RADIUS + 17)
 #define PEER_MAX_DISPLAY_METERS 100.0f
 unsigned long nextHeartbeat = 0;
 
@@ -214,12 +221,30 @@ bool cachedRemoteAsleep[4] = {false, false, false, false};
 String pingMessage = "";
 unsigned long pingMessageTime = 0;
 #define PING_MESSAGE_TIME 5000UL
-#define PING_ACK_TIMEOUT 3000UL
+// How long "Sending..." stays up waiting for the reply. There is no TIMEOUT
+// message; this only stops a lost reply from locking the ping button.
+#define PING_REPLY_WINDOW 3000UL
+// Broadcast replies arrive in per-device slots (ID x 250 ms); this window
+// collects all of them before "You pinged everyone" is shown.
+#define PING_BROADCAST_WINDOW 1200UL
+#define PING_BROADCAST_SLOT 250UL
 uint16_t pingSequence = 0;
 bool pingPending = false;
 int pendingPingTarget = 0;
+bool pendingPingBroadcast = false;
 uint16_t pendingPingSequence = 0;
 unsigned long pendingPingStartedAt = 0;
+bool broadcastAckSeen[4] = {false, false, false, false};
+uint8_t broadcastAckCount = 0;
+// Broadcast pings are acknowledged later, in this device's own time slot,
+// so the replies from two receivers do not collide on air.
+struct ScheduledPingAck {
+  bool pending = false;
+  uint16_t sequence = 0;
+  unsigned long receivedAt = 0;
+  unsigned long dueAt = 0;
+};
+ScheduledPingAck scheduledPingAck[4];
 bool receivedPingSequenceValid[4][4] = {};
 uint16_t receivedPingSequences[4][4] = {};
 uint8_t receivedPingSequenceNext[4] = {0, 0, 0, 0};
@@ -313,7 +338,9 @@ void sendStateResponse(int targetId);
 void sendSleepLocationReport();
 void setSleepMode(bool enabled);
 void sendPing(int targetId);
-void checkPingTimeout();
+void updatePing();
+void acknowledgePing(int requesterId, int targetId, uint16_t sequence,
+                     unsigned long receivedAt);
 void receiveLoRa();
 void handlePacketTest(const String &packet);
 void runPacketTest();
@@ -1178,12 +1205,10 @@ void sendStateResponse(int targetId) {
 
 void sendPing(int targetId) {
   if (targetId < 0 || targetId > 3 || targetId == DEVICE_ID) return;
-  if (pingPending) {
-    pingMessage = "PING IN PROGRESS";
-    pingMessageTime = millis();
-    updateMainMenuDynamic(true);
-    return;
-  }
+  // A ping is already on its way: keep "Sending..." on screen and ignore the
+  // extra tap so a double/triple tap cannot send more than one ping.
+  if (pingPending) return;
+
   digitalWrite(TFT_CS, HIGH);
   digitalWrite(TOUCH_CS, HIGH);
 
@@ -1193,21 +1218,22 @@ void sendPing(int targetId) {
   uint16_t sequence = ++pingSequence;
   if (sequence == 0) sequence = ++pingSequence;
   String packet = "P," + String(DEVICE_ID) + "," + String(targetId) + "," + String(sequence);
-  if (targetId == 0) {
-    pingMessage = "BROADCAST SENT; RTT N/A";
-  } else {
-    pingPending = true;
-    pendingPingTarget = targetId;
-    pendingPingSequence = sequence;
-    pingMessage = "PING LORA #" + String(targetId) + " WAITING...";
-  }
+
+  pingPending = true;
+  pendingPingTarget = targetId;
+  pendingPingBroadcast = (targetId == 0);
+  pendingPingSequence = sequence;
+  broadcastAckCount = 0;
+  for (int id = 1; id <= 3; ++id) broadcastAckSeen[id] = false;
+  pingMessage = "Sending...";
   pingMessageTime = millis();
   if (currentScreen == MAIN_MENU) {
     updateMainMenuDynamic(true);
   }
 
-  // One radio transmission per user action. Only targeted pings expect an ACK.
-  if (targetId != 0) pendingPingStartedAt = millis();
+  // One radio transmission per user action. Targeted and broadcast pings
+  // both expect ACKs; latency is measured from this moment.
+  pendingPingStartedAt = millis();
   LoRa.beginPacket();
   LoRa.print(packet);
   LoRa.endPacket();
@@ -1220,10 +1246,31 @@ void sendPing(int targetId) {
   }
 }
 
-void checkPingTimeout() {
-  if (!pingPending || millis() - pendingPingStartedAt < PING_ACK_TIMEOUT) return;
+void updatePing() {
+  // Receiver side: send broadcast ACKs whose time slot has arrived.
+  for (int id = 1; id <= 3; ++id) {
+    if (!scheduledPingAck[id].pending ||
+        (long)(millis() - scheduledPingAck[id].dueAt) < 0) continue;
+    scheduledPingAck[id].pending = false;
+    acknowledgePing(id, 0, scheduledPingAck[id].sequence,
+                    scheduledPingAck[id].receivedAt);
+  }
+
+  // Sender side: finish the broadcast after its collection window, or
+  // release the "Sending..." lock if a targeted reply never arrived.
+  if (!pingPending) return;
+  unsigned long elapsed = millis() - pendingPingStartedAt;
+  if (pendingPingBroadcast) {
+    if (elapsed < PING_BROADCAST_WINDOW) return;
+    pingMessage = broadcastAckCount
+      ? "You pinged everyone (" + String(elapsed) + " ms)"
+      : String("No device replied");
+  } else {
+    if (elapsed < PING_REPLY_WINDOW) return;
+    pingMessage = "Lora #" + String(pendingPingTarget) + " did not reply";
+  }
   pingPending = false;
-  pingMessage = "PING LORA #" + String(pendingPingTarget) + " TIMEOUT";
+  pendingPingBroadcast = false;
   pingMessageTime = millis();
   if (currentScreen == MAIN_MENU) updateMainMenuDynamic(true);
 }
@@ -1246,6 +1293,20 @@ void sendPingAck(int requesterId, int targetId, uint16_t sequence) {
   LoRa.receive();
 }
 
+// Send the ACK first, then show the notification. The receiver's figure is
+// measured on its own clock: ping received -> ACK fully transmitted
+// (LoRa.endPacket() returns only after transmission completes). For a
+// broadcast it includes this device's reply slot delay.
+void acknowledgePing(int requesterId, int targetId, uint16_t sequence,
+                     unsigned long receivedAt) {
+  sendPingAck(requesterId, targetId, sequence);
+  unsigned long responseMs = millis() - receivedAt;
+  pingMessage = "Lora #" + String(requesterId) + " pinged you (" +
+                String(responseMs) + " ms)";
+  pingMessageTime = millis();
+  if (currentScreen == MAIN_MENU) updateMainMenuDynamic(true);
+}
+
 // =====================================================
 // LORA RECEIVE
 // =====================================================
@@ -1258,6 +1319,7 @@ void receiveLoRa() {
 
   String packet = "";
   while (LoRa.available()) packet += (char)LoRa.read();
+  unsigned long packetReceivedAt = millis();
 
   Serial.print("LoRa RX: ");
   Serial.println(packet);
@@ -1447,15 +1509,30 @@ void receiveLoRa() {
       int target = packet.substring(second + 1, third).toInt();
       uint16_t sequence = 0;
       bool sequenceValid = parsePingSequence(packet.substring(third + 1), sequence);
-      if (sequenceValid && pingPending && millis() - pendingPingStartedAt < PING_ACK_TIMEOUT &&
+      if (sequenceValid && pingPending &&
+          millis() - pendingPingStartedAt <
+            (pendingPingBroadcast ? PING_BROADCAST_WINDOW : PING_REPLY_WINDOW) &&
           requester == DEVICE_ID && target == pendingPingTarget &&
-          responder == pendingPingTarget && sequence == pendingPingSequence) {
+          responder >= 1 && responder <= 3 && responder != DEVICE_ID &&
+          sequence == pendingPingSequence) {
         unsigned long rtt = millis() - pendingPingStartedAt;
-        pingPending = false;
-        pingMessage = "PINGED LORA #" + String(responder) + " | RTT: " + String(rtt) + " ms";
-        pingMessageTime = millis();
-        Serial.printf("PING RTT target=%d seq=%u rtt_ms=%lu\n", responder, sequence, rtt);
-        if (currentScreen == MAIN_MENU) updateMainMenuDynamic(true);
+        if (pendingPingBroadcast) {
+          // Collect every responder once; the message is shown when the
+          // broadcast window closes (see updatePing()).
+          if (!broadcastAckSeen[responder]) {
+            broadcastAckSeen[responder] = true;
+            ++broadcastAckCount;
+            Serial.printf("PING BROADCAST ACK responder=%d seq=%u rtt_ms=%lu\n",
+                          responder, sequence, rtt);
+          }
+        } else if (responder == pendingPingTarget) {
+          pingPending = false;
+          pingMessage = "You pinged Lora #" + String(responder) + " (" +
+                        String(rtt) + " ms)";
+          pingMessageTime = millis();
+          Serial.printf("PING RTT target=%d seq=%u rtt_ms=%lu\n", responder, sequence, rtt);
+          if (currentScreen == MAIN_MENU) updateMainMenuDynamic(true);
+        }
       }
     }
     LoRa.receive();
@@ -1490,11 +1567,17 @@ void receiveLoRa() {
         remote[sender].asleep = false;
         cachedRemoteOnline[sender] = true;
         cachedRemoteAsleep[sender] = false;
-        pingMessage = "LORA #" + String(sender) +
-                      (target == 0 ? " PINGED EVERYONE" : " PINGED YOU");
-        pingMessageTime = millis();
-        if (currentScreen == MAIN_MENU) updateMainMenuDynamic(true);
-        if (target != 0) sendPingAck(sender, target, sequence);
+        if (target == 0) {
+          // Broadcast: reply in this device's own slot to avoid collisions.
+          scheduledPingAck[sender].pending = true;
+          scheduledPingAck[sender].sequence = sequence;
+          scheduledPingAck[sender].receivedAt = packetReceivedAt;
+          scheduledPingAck[sender].dueAt =
+            packetReceivedAt + (unsigned long)DEVICE_ID * PING_BROADCAST_SLOT;
+        } else {
+          // Targeted: ACK immediately, before any screen redraw.
+          acknowledgePing(sender, target, sequence, packetReceivedAt);
+        }
       }
     }
   }
@@ -1867,17 +1950,14 @@ void drawPeerLegendLine(int deviceId, int y) {
   uint16_t color = deviceColor(deviceId);
   bool positionValid = localLocationValid() && remoteLocationFresh(deviceId);
   String distanceText = positionValid
-    ? String((int)roundf(distanceToPeer(remote[deviceId].lat, remote[deviceId].lon))) + "m"
+    ? String((int)roundf(distanceToPeer(remote[deviceId].lat, remote[deviceId].lon)))
     : String("N/A");
-  String bearingText = positionValid && magnetometerPresent
-    ? String(relativeBearingDegrees(remote[deviceId].lat, remote[deviceId].lon))
+  // Same relative bearing the radar dot uses, shown as N/NE/E/...
+  String directionText = positionValid && magnetometerPresent
+    ? shortDirection((float)relativeBearingDegrees(remote[deviceId].lat, remote[deviceId].lon))
     : String("--");
-  String remoteHeadingText = remote[deviceId].online && remote[deviceId].headingValid
-    ? shortDirection(remote[deviceId].remoteHeading) : String("--");
-  String status = !remote[deviceId].online ? "OFFLINE"
-    : (remote[deviceId].asleep ? "SLEEPING" : "ONLINE");
-  String line = "LORA #" + String(deviceId) + " " + distanceText +
-                " B:" + bearingText + " H:" + remoteHeadingText + " " + status;
+  String line = "LORA #" + String(deviceId) + " | " + distanceText +
+                " meters away! | " + directionText;
 
   tft.setTextSize(1);
   tft.setTextColor(WHITE, BLACK);
@@ -1950,8 +2030,9 @@ void drawPeerLocation() {
 }
 
 void drawCardinalLetter(const char *letter, int x, int y, bool active) {
-  // Erase only the tiny label region, never the compass circle.
-  tft.fillRect(x - 2, y - 2, 24, 20, BLACK);
+  // Erase only the letter's own 12x16 cell (+1 px). The old 24x20 box
+  // reached up to 16 px right of the letter and cut into the circle.
+  tft.fillRect(x - 1, y - 1, 12, 16, BLACK);
   tft.setTextSize(2);
   tft.setTextColor(active ? RED : WHITE, BLACK);
   tft.setCursor(x, y);
@@ -1965,16 +2046,16 @@ void updatePeerCardinals(bool force) {
   float localHeading = magnetometerPresent ? heading : 0.0f;
   for (int i = 0; i < 4; ++i) {
     if (lastCardinalLabel[i].valid) {
-      tft.fillRect(lastCardinalLabel[i].x - 2, lastCardinalLabel[i].y - 2,
-                   24, 20, BLACK);
+      tft.fillRect(lastCardinalLabel[i].x - 1, lastCardinalLabel[i].y - 1,
+                   12, 16, BLACK);
     }
   }
   tft.drawCircle(PEER_CIRCLE_CENTER_X, PEER_CIRCLE_CENTER_Y,
                  PEER_CIRCLE_RADIUS, WHITE);
   for (int i = 0; i < 4; ++i) {
     float relative = normalizeBearing(bearings[i] - localHeading) * PI / 180.0f;
-    int centerX = PEER_CIRCLE_CENTER_X + (int)roundf(sinf(relative) * (PEER_CIRCLE_RADIUS + 13));
-    int centerY = PEER_CIRCLE_CENTER_Y - (int)roundf(cosf(relative) * (PEER_CIRCLE_RADIUS + 13));
+    int centerX = PEER_CIRCLE_CENTER_X + (int)roundf(sinf(relative) * PEER_CARDINAL_ORBIT);
+    int centerY = PEER_CIRCLE_CENTER_Y - (int)roundf(cosf(relative) * PEER_CARDINAL_ORBIT);
     int x = centerX - 6;
     int y = centerY - 8;
     drawCardinalLetter(labels[i], x, y,
@@ -2096,20 +2177,19 @@ void updatePeerDynamicText(const String &locationText, bool locationOk,
     int id = ids[k];
     int y = ys[k];
 
-    String relativeBearing = localLocationValid() && remoteLocationFresh(id) && magnetometerPresent
-      ? String(relativeBearingDegrees(remote[id].lat, remote[id].lon))
+    String directionText = localLocationValid() && remoteLocationFresh(id) && magnetometerPresent
+      ? shortDirection((float)relativeBearingDegrees(remote[id].lat, remote[id].lon))
       : String("--");
     String shown = localLocationValid() && remoteLocationFresh(id)
-      ? String((int)roundf(distanceToPeer(remote[id].lat, remote[id].lon))) + "m"
+      ? String((int)roundf(distanceToPeer(remote[id].lat, remote[id].lon)))
       : String("N/A");
-    String remoteHeading = remote[id].online && remote[id].headingValid
-      ? shortDirection(remote[id].remoteHeading) : String("--");
-    String status = !remote[id].online ? "OFFLINE"
-      : (remote[id].asleep ? "SLEEPING" : "ONLINE");
-    String line = "LORA #" + String(id) + " " + shown + " B:" + relativeBearing +
-                  " H:" + remoteHeading + " " + status;
+    String line = "LORA #" + String(id) + " | " + shown +
+                  " meters away! | " + directionText;
 
-    String displayKey = line + (remote[id].asleep ? "|ASLEEP" : "|AWAKE");
+    // Status is no longer printed in the row, but it still sets the text
+    // color (gray offline / yellow asleep), so keep it in the redraw key.
+    String displayKey = line + (remote[id].online ? "|ONLINE" : "|OFFLINE") +
+                        (remote[id].asleep ? "|ASLEEP" : "|AWAKE");
 
     if (displayKey != lastPeerDistanceDisplay[id]) {
       // Clear the complete row, including the bullet, then redraw it centered.
@@ -2972,7 +3052,7 @@ void loop() {
   updateGPS();
   updateCompass();
   receiveLoRa();
-  checkPingTimeout();
+  updatePing();
   updateDeviceStatus();
   processTouch();
 
