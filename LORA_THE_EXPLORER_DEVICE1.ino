@@ -1,6 +1,6 @@
-// Current Version: v2.1.1.1
-// Fixed ping replies and messages, compass label/circle overlap, and the device list format.
-// Ping: "Sending..." blocks repeat taps, TIMEOUT message removed, receiver ACKs before redrawing, broadcast pings now get staggered ACKs, and sender/receiver show "You pinged Lora #N (X ms)" / "Lora #N pinged you (X ms)"; compass radius 80 -> 76 px with letters kept at the same 93 px orbit and a tight letter erase box; rows now read "LORA #N | D meters away! | DIR".
+// Current Version: v2.1.2.0
+// Added automatic proximity sleep (10 m group threshold, 30 s entry confirmation, 60 s continuous out-of-range exit) with the single-offline-device exception, and fixed remote compass headings.
+// New proximity state machine pauses on missing/stale GPS instead of waking; sleeping devices wake the radio in GPS-time-aligned 2 s windows every 10 s to exchange SLP code-2 reports; remote headings keep their last valid value with a timestamp (a "360.0" rounding no longer invalidates them) and are drawn as a facing tick on each radar dot; GPS DIST log now includes relative bearing and remote heading.
 
 #include <Arduino.h>
 #include <SPI.h>
@@ -175,6 +175,11 @@ struct RemoteDevice {
   unsigned long lastSeen = 0;
   unsigned long locationUpdatedAt = 0;
   uint8_t heartbeatCount = 0;
+  // Asleep because of automatic proximity sleep (SLP code 2), as opposed to
+  // the manual 5-minute sleep mode (SLP code 1).
+  bool proximitySleep = false;
+  // Last time a valid compass heading was received from this device.
+  unsigned long headingUpdatedAt = 0;
 };
 
 RemoteDevice remote[4];
@@ -213,6 +218,73 @@ bool resumeStatusSync = false;
 unsigned long resumeStatusSyncUntil = 0;
 bool cachedRemoteOnline[4] = {false, false, false, false};
 bool cachedRemoteAsleep[4] = {false, false, false, false};
+
+// =====================================================
+// AUTOMATIC PROXIMITY SLEEP
+// =====================================================
+// Rules:
+//  - The group is "together" when every pairwise GPS distance is within
+//    PROX_THRESHOLD_M (all three pairs, or the remaining pair when exactly
+//    one device is confirmed offline - that device is left awake for recovery).
+//  - Enter: together for PROX_ENTRY_CONFIRM_MS of valid checks.
+//  - Exit: apart for PROX_EXIT_OUT_OF_RANGE_MS of continuous valid checks.
+//    Coming back within range resets the exit timer.
+//  - Missing/stale GPS pauses the decision (PROX_UNKNOWN); it never counts
+//    as being apart and never changes the current sleep state.
+// Note: the thesis text specifies 50 m; this build uses 10 m as requested.
+#define PROX_THRESHOLD_M           10.0f
+#define PROX_ENTRY_CONFIRM_MS      30000UL
+#define PROX_EXIT_OUT_OF_RANGE_MS  60000UL
+#define PROX_EVAL_INTERVAL_MS      2000UL
+// Peer coordinates older than this are not used for a proximity decision.
+#define PROX_LOCATION_MAX_AGE_MS   25000UL
+// After waking, wait this long (fresh GPS + status) before a new decision.
+#define PROX_RECOVERY_HOLD_MS      20000UL
+// A peer counts as confirmed offline only after this much silence.
+#define PROX_OFFLINE_CONFIRM_MS    60000UL
+// Online timeout for peers heard only in proximity-sleep windows.
+#define PROX_PEER_TIMEOUT          45000UL
+// While asleep the radio is on only in a 2 s window every 10 s, aligned to
+// GPS UTC time so all devices listen at the same moment. Each device sends
+// its report in its own slot inside that window.
+#define PROX_CYCLE_MS              10000UL
+#define PROX_WINDOW_MS             2000UL
+#define PROX_SLOT_BASE_MS          300UL
+#define PROX_SLOT_SPACING_MS       400UL
+// Without GPS time the radio stays on and reports on this local timer.
+#define PROX_UNSYNCED_REPORT_MS    10000UL
+
+enum ProximityState {
+  PROX_NORMAL_OPERATION,
+  PROX_CONFIRMATION,
+  PROX_SLEEP,
+  PROX_OUT_OF_RANGE_MONITORING,
+  PROX_WAKE_AND_RECOVERY,
+  PROX_UNKNOWN
+};
+
+enum ProximityReading {
+  PROX_READING_IN_RANGE,
+  PROX_READING_OUT_OF_RANGE,
+  PROX_READING_UNKNOWN
+};
+
+ProximityState proxState = PROX_NORMAL_OPERATION;
+ProximityState proxStateBeforeUnknown = PROX_NORMAL_OPERATION;
+bool proxSleepActive = false;
+unsigned long proxLastEvalAt = 0;
+// Time accumulated in the current confirmation / out-of-range period.
+unsigned long proxAccumMs = 0;
+// proxChainValid is false after an unknown reading, so the gap is not counted.
+bool proxChainValid = false;
+unsigned long proxChainAt = 0;
+unsigned long proxRecoveryUntil = 0;
+int proxOfflineDevice = 0;
+ProximityReading proxLastReading = PROX_READING_UNKNOWN;
+unsigned long proxLastLogAt = 0;
+uint32_t proxLastReportCycle = 0xFFFFFFFFUL;
+uint32_t proxLastSlotHeartbeatCycle = 0xFFFFFFFFUL;
+unsigned long proxLastUnsyncedReport = 0;
 
 // =====================================================
 // PING
@@ -358,8 +430,24 @@ float normalizeBearing(float degrees);
 bool validCoordinates(double lat, double lon);
 bool localLocationValid();
 bool remoteLocationFresh(int deviceId);
+// headingFlag: 1 = valid heading in packet, 0 = sender reports no
+// magnetometer, -1 = packet carried no heading field (keep the last value).
 void updateRemoteLocation(int deviceId, bool gpsValid, double lat, double lon,
-                          bool headingValid, float remoteHeading);
+                          int headingFlag, float remoteHeading);
+unsigned long remoteDataMaxAge(int deviceId);
+bool remoteHeadingCurrent(int deviceId);
+
+void updateProximity();
+void serviceProximitySleep();
+void enterProximitySleep();
+void exitProximitySleep();
+void sendProximitySleepReport();
+ProximityReading evaluateGroupProximity(int &offlineDevice, float distances[3]);
+bool peerConfirmedOffline(int deviceId);
+bool peerLocationFreshForProximity(int deviceId);
+bool anyPeerInProximitySleep();
+bool gpsUtcMillisOfDay(uint32_t &msOfDay);
+const char *proximityStateName(ProximityState state);
 void logPeerMeasurement(int deviceId, float bearing, float distance);
 int relativeBearingDegrees(double peerLat, double peerLon);
 bool parsePingSequence(const String &text, uint16_t &sequence);
@@ -598,8 +686,19 @@ struct PeerDotCache {
   int x = 0;
   int y = 0;
   uint16_t color = BLACK;
+  // Short line from the dot showing which way that peer is facing.
+  bool tickValid = false;
+  int tickX = 0;
+  int tickY = 0;
 };
 PeerDotCache lastPeerDot[4];
+// Remote heading last drawn as a tick, in 5-degree steps (-1 = none), so a
+// peer turning redraws its tick without redrawing on every tiny change.
+int lastPeerRemoteHeadingStep[4] = {-1, -1, -1, -1};
+// Facing tick length from the dot centre. Dots sit at most
+// PEER_CIRCLE_RADIUS - 8 from the centre, so 6 px keeps the tick inside
+// the circle outline.
+#define PEER_HEADING_TICK_LEN 6.0f
 struct CardinalLabelCache {
   bool valid = false;
   int x = 0;
@@ -674,16 +773,32 @@ bool localLocationValid() {
          validCoordinates(latitude, longitude);
 }
 
+// How old a peer's location/heading may be before it is shown as stale.
+// Awake peers send every 3 s, proximity-sleeping peers every 10 s, and
+// manually sleeping peers every 5 minutes.
+unsigned long remoteDataMaxAge(int deviceId) {
+  if (!remote[deviceId].asleep) return 15000UL;
+  return remote[deviceId].proximitySleep ? 30000UL : 360000UL;
+}
+
 bool remoteLocationFresh(int deviceId) {
   if (deviceId < 1 || deviceId > 3 || deviceId == DEVICE_ID ||
       !remote[deviceId].online || !remote[deviceId].gpsValid ||
       remote[deviceId].locationUpdatedAt == 0) return false;
-  unsigned long maxAge = remote[deviceId].asleep ? 360000UL : 15000UL;
-  return millis() - remote[deviceId].locationUpdatedAt <= maxAge;
+  return millis() - remote[deviceId].locationUpdatedAt <= remoteDataMaxAge(deviceId);
+}
+
+// A remote heading is shown only while it is current; the last value is kept
+// (with its timestamp) but never presented as current once it is stale.
+bool remoteHeadingCurrent(int deviceId) {
+  if (deviceId < 1 || deviceId > 3 || deviceId == DEVICE_ID ||
+      !remote[deviceId].online || !remote[deviceId].headingValid ||
+      remote[deviceId].headingUpdatedAt == 0) return false;
+  return millis() - remote[deviceId].headingUpdatedAt <= remoteDataMaxAge(deviceId);
 }
 
 void updateRemoteLocation(int deviceId, bool hasFix, double lat, double lon,
-                          bool hasHeading, float peerHeading) {
+                          int headingFlag, float peerHeading) {
   bool coordinatesOk = hasFix && validCoordinates(lat, lon);
   remote[deviceId].gpsValid = coordinatesOk;
   if (coordinatesOk) {
@@ -691,9 +806,22 @@ void updateRemoteLocation(int deviceId, bool hasFix, double lat, double lon,
     remote[deviceId].lon = lon;
     remote[deviceId].locationUpdatedAt = millis();
   }
-  remote[deviceId].headingValid = hasHeading && isfinite(peerHeading) &&
-                                  peerHeading >= 0.0f && peerHeading < 360.0f;
-  if (remote[deviceId].headingValid) remote[deviceId].remoteHeading = peerHeading;
+
+  if (headingFlag == 1) {
+    // String(heading, 1) prints a heading of 359.95..359.99 as "360.0";
+    // previously that value was rejected and the heading showed as "--".
+    if (peerHeading >= 360.0f && peerHeading < 360.5f) peerHeading = 0.0f;
+    if (isfinite(peerHeading) && peerHeading >= 0.0f && peerHeading < 360.0f) {
+      remote[deviceId].headingValid = true;
+      remote[deviceId].remoteHeading = peerHeading;
+      remote[deviceId].headingUpdatedAt = millis();
+    }
+    // An unparsable value keeps the previous valid heading.
+  } else if (headingFlag == 0) {
+    // The peer explicitly reports that it has no working magnetometer.
+    remote[deviceId].headingValid = false;
+  }
+  // headingFlag == -1: no heading field in this packet; keep the last value.
 }
 
 float normalizeBearing(float degrees) {
@@ -706,11 +834,16 @@ void logPeerMeasurement(int deviceId, float bearing, float distance) {
   unsigned long now = millis();
   if (now - lastDistanceLog[deviceId] < 5000UL) return;
   lastDistanceLog[deviceId] = now;
-  Serial.printf("GPS DIST local=%d %.6f,%.6f fix=%d peer=%d %.6f,%.6f fix=%d age_ms=%lu bearing_deg=%.1f distance_m=%.1f\n",
-                DEVICE_ID, latitude, longitude, localLocationValid(), deviceId,
+  // bearing_deg = geographic bearing from this device to the peer;
+  // rel_deg = bearing relative to where this device is facing (radar angle);
+  // peer_hdg = the direction the peer itself faces (-1 = not current).
+  Serial.printf("GPS DIST local=%d %.6f,%.6f fix=%d hdg=%.1f peer=%d %.6f,%.6f fix=%d age_ms=%lu bearing_deg=%.1f rel_deg=%.1f distance_m=%.1f peer_hdg=%.1f\n",
+                DEVICE_ID, latitude, longitude, localLocationValid(), heading, deviceId,
                 remote[deviceId].lat, remote[deviceId].lon,
                 remoteLocationFresh(deviceId),
-                now - remote[deviceId].locationUpdatedAt, bearing, distance);
+                now - remote[deviceId].locationUpdatedAt, bearing,
+                normalizeBearing(bearing - heading), distance,
+                remoteHeadingCurrent(deviceId) ? remote[deviceId].remoteHeading : -1.0f);
 }
 
 int relativeBearingDegrees(double peerLat, double peerLon) {
@@ -1176,7 +1309,8 @@ void sendStateResponse(int targetId) {
   digitalWrite(TOUCH_CS, HIGH);
 
   String packet = "STATE," + String(DEVICE_ID) + "," + String(targetId) + ",";
-  packet += String(sleepMode ? 1 : 0);
+  // 0 = awake, 1 = manual sleep, 2 = automatic proximity sleep.
+  packet += String(sleepMode ? 1 : (proxSleepActive ? 2 : 0));
   packet += ",";
   packet += String(localLocationValid() ? 1 : 0);
   packet += ",";
@@ -1357,13 +1491,14 @@ void receiveLoRa() {
         // One valid heartbeat is enough to mark the peer ONLINE immediately.
         remote[sender].lastSeen = millis();
         remote[sender].asleep = false;
+        remote[sender].proximitySleep = false;
         remote[sender].online = true;
         remote[sender].heartbeatCount = ONLINE_CONFIRM_PACKETS;
         cachedRemoteOnline[sender] = true;
         cachedRemoteAsleep[sender] = false;
 
         updateRemoteLocation(sender, f[1].toInt() == 1, f[2].toDouble(),
-                 f[3].toDouble(), count >= 12 && f[10].toInt() == 1,
+                 f[3].toDouble(), count >= 12 ? f[10].toInt() : -1,
                  count >= 12 ? f[11].toFloat() : -1.0f);
 
         int h = f[4].toInt();
@@ -1394,7 +1529,8 @@ void receiveLoRa() {
 
   // ---------------------------------------------------
   // SLEEP LOCATION REPORT
-  // SLP,id,1,gpsFix,lat,lon
+  // SLP,id,mode,gpsFix,lat,lon,magPresent,heading
+  // mode: 1 = manual sleep (every 5 min), 2 = proximity sleep (every 10 s)
   // ---------------------------------------------------
   if (packet.startsWith("SLP,")) {
     String f[7];
@@ -1416,14 +1552,16 @@ void receiveLoRa() {
       int enabled = f[1].toInt();
 
       if (sender >= 1 && sender <= 3 && sender != DEVICE_ID) {
+        bool sleeping = (enabled == 1 || enabled == 2);
         remote[sender].lastSeen = millis();
-        remote[sender].asleep = (enabled == 1);
+        remote[sender].asleep = sleeping;
+        remote[sender].proximitySleep = (enabled == 2);
         remote[sender].online = true;
         remote[sender].heartbeatCount = ONLINE_CONFIRM_PACKETS;
         cachedRemoteOnline[sender] = true;
-        cachedRemoteAsleep[sender] = (enabled == 1);
+        cachedRemoteAsleep[sender] = sleeping;
         updateRemoteLocation(sender, f[2].toInt() == 1, f[3].toDouble(),
-                 f[4].toDouble(), count >= 7 && f[5].toInt() == 1,
+                 f[4].toDouble(), count >= 7 ? f[5].toInt() : -1,
                  count >= 7 ? f[6].toFloat() : -1.0f);
       }
     }
@@ -1476,14 +1614,16 @@ void receiveLoRa() {
           sender >= 1 && sender <= 3 &&
           sender != DEVICE_ID) {
 
-        bool asleep = (f[2].toInt() == 1);
+        int sleepCode = f[2].toInt();
+        bool asleep = (sleepCode == 1 || sleepCode == 2);
 
         remote[sender].lastSeen = millis();
         remote[sender].asleep = asleep;
+        remote[sender].proximitySleep = (sleepCode == 2);
         remote[sender].online = true;
         remote[sender].heartbeatCount = ONLINE_CONFIRM_PACKETS;
         updateRemoteLocation(sender, f[3].toInt() == 1, f[4].toDouble(),
-                 f[5].toDouble(), count >= 8 && f[6].toInt() == 1,
+                 f[5].toDouble(), count >= 8 ? f[6].toInt() : -1,
                  count >= 8 ? f[7].toFloat() : -1.0f);
 
         cachedRemoteOnline[sender] = true;
@@ -1589,7 +1729,7 @@ void updateDeviceStatus() {
 
   // Our own state is always known locally.
   remote[DEVICE_ID].online = true;
-  remote[DEVICE_ID].asleep = sleepMode;
+  remote[DEVICE_ID].asleep = sleepMode || proxSleepActive;
 
   // While this device is sleeping, preserve the exact last-known remote
   // statuses. Do NOT let the local timeout logic turn them OFFLINE.
@@ -1620,12 +1760,18 @@ void updateDeviceStatus() {
       continue;
     }
 
-    unsigned long timeout =
-      remote[i].asleep ? SLEEP_DEVICE_TIMEOUT : DEVICE_TIMEOUT;
+    unsigned long timeout = remote[i].asleep
+      ? (remote[i].proximitySleep ? PROX_PEER_TIMEOUT : SLEEP_DEVICE_TIMEOUT)
+      : DEVICE_TIMEOUT;
+    // While THIS device is in proximity sleep it only listens 2 s out of
+    // every 10 s, so awake peers are heard less often. Do not mistake that
+    // for them going offline.
+    if (proxSleepActive && timeout < PROX_PEER_TIMEOUT) timeout = PROX_PEER_TIMEOUT;
 
     if (now - remote[i].lastSeen > timeout) {
       remote[i].online = false;
       remote[i].asleep = false;
+      remote[i].proximitySleep = false;
     }
   }
 }
@@ -1679,6 +1825,9 @@ void setSleepMode(bool enabled) {
     remoteStatusFrozen = true;
     resumeStatusSync = false;
     sleepMode = true;
+    // Manual sleep takes over from automatic proximity sleep (if active);
+    // updateProximity() resets the proximity state machine.
+    proxSleepActive = false;
     remote[DEVICE_ID].online = true;
     remote[DEVICE_ID].asleep = true;
 
@@ -1717,6 +1866,332 @@ void setSleepMode(bool enabled) {
     nextHeartbeat = millis() + HEARTBEAT_INTERVAL;
 
     Serial.println("SLEEP MODE DISABLED - RESYNCING STATUSES");
+  }
+}
+
+// =====================================================
+// AUTOMATIC PROXIMITY SLEEP
+// =====================================================
+
+const char *proximityStateName(ProximityState state) {
+  switch (state) {
+    case PROX_NORMAL_OPERATION:        return "NORMAL_OPERATION";
+    case PROX_CONFIRMATION:            return "PROXIMITY_CONFIRMATION";
+    case PROX_SLEEP:                   return "PROXIMITY_SLEEP";
+    case PROX_OUT_OF_RANGE_MONITORING: return "OUT_OF_RANGE_MONITORING";
+    case PROX_WAKE_AND_RECOVERY:       return "WAKE_AND_RECOVERY";
+    case PROX_UNKNOWN:                 return "PROXIMITY_UNKNOWN";
+  }
+  return "?";
+}
+
+// UTC time of day in ms from the GPS, used only to line up the sleep
+// listening windows of the three devices. Accuracy is limited by NMEA
+// sentence latency (typically well under 1 s), which the 2 s window absorbs.
+bool gpsUtcMillisOfDay(uint32_t &msOfDay) {
+  if (!gps.time.isValid() || gps.time.age() > 2000UL) return false;
+  uint32_t t = ((uint32_t)gps.time.hour() * 3600UL +
+                (uint32_t)gps.time.minute() * 60UL +
+                (uint32_t)gps.time.second()) * 1000UL +
+               (uint32_t)gps.time.centisecond() * 10UL + gps.time.age();
+  msOfDay = t % 86400000UL;
+  return true;
+}
+
+uint32_t proxSlotOffset() {
+  return PROX_SLOT_BASE_MS + (uint32_t)(DEVICE_ID - 1) * PROX_SLOT_SPACING_MS;
+}
+
+// Offline means silent for a long time - never just asleep. A peer in either
+// sleep mode keeps reporting, so it stays online.
+bool peerConfirmedOffline(int deviceId) {
+  if (remote[deviceId].online) return false;
+  if (remote[deviceId].lastSeen == 0) return millis() >= PROX_OFFLINE_CONFIRM_MS;
+  return millis() - remote[deviceId].lastSeen >= PROX_OFFLINE_CONFIRM_MS;
+}
+
+bool peerLocationFreshForProximity(int deviceId) {
+  return remote[deviceId].online && remote[deviceId].gpsValid &&
+         remote[deviceId].locationUpdatedAt != 0 &&
+         millis() - remote[deviceId].locationUpdatedAt <= PROX_LOCATION_MAX_AGE_MS;
+}
+
+bool anyPeerInProximitySleep() {
+  for (int i = 1; i <= 3; ++i) {
+    if (i == DEVICE_ID) continue;
+    if (remote[i].online && remote[i].asleep && remote[i].proximitySleep) return true;
+  }
+  return false;
+}
+
+// distances[0] = this device <-> peer A, [1] = this device <-> peer B,
+// [2] = peer A <-> peer B (-1 when not computed).
+ProximityReading evaluateGroupProximity(int &offlineDevice, float distances[3]) {
+  offlineDevice = 0;
+  distances[0] = distances[1] = distances[2] = -1.0f;
+
+  // No local fix: the decision is paused, never treated as "apart".
+  if (!localLocationValid()) return PROX_READING_UNKNOWN;
+
+  int peers[2];
+  int n = 0;
+  for (int i = 1; i <= 3; ++i) if (i != DEVICE_ID) peers[n++] = i;
+
+  bool offline[2] = {peerConfirmedOffline(peers[0]), peerConfirmedOffline(peers[1])};
+  bool fresh[2] = {peerLocationFreshForProximity(peers[0]),
+                   peerLocationFreshForProximity(peers[1])};
+
+  // Both others confirmed offline: there is no group to be "together" with.
+  // This never starts proximity sleep and lets a sleeping device recover
+  // through the normal 60 s exit rule.
+  if (offline[0] && offline[1]) return PROX_READING_OUT_OF_RANGE;
+
+  // Exactly one device confirmed offline: it is left out of the group (and
+  // stays awake for recovery); the other two decide on their own distance.
+  if (offline[0] || offline[1]) {
+    int k = offline[0] ? 1 : 0;
+    offlineDevice = peers[offline[0] ? 0 : 1];
+    if (!fresh[k]) return PROX_READING_UNKNOWN;
+    distances[k] = distanceToPeer(remote[peers[k]].lat, remote[peers[k]].lon);
+    return distances[k] <= PROX_THRESHOLD_M ? PROX_READING_IN_RANGE
+                                            : PROX_READING_OUT_OF_RANGE;
+  }
+
+  // Normal case: all three pairwise distances must be within the threshold.
+  if (!fresh[0] || !fresh[1]) return PROX_READING_UNKNOWN;
+  distances[0] = distanceToPeer(remote[peers[0]].lat, remote[peers[0]].lon);
+  distances[1] = distanceToPeer(remote[peers[1]].lat, remote[peers[1]].lon);
+  distances[2] = (float)TinyGPSPlus::distanceBetween(
+    remote[peers[0]].lat, remote[peers[0]].lon,
+    remote[peers[1]].lat, remote[peers[1]].lon);
+  bool together = distances[0] <= PROX_THRESHOLD_M &&
+                  distances[1] <= PROX_THRESHOLD_M &&
+                  distances[2] <= PROX_THRESHOLD_M;
+  return together ? PROX_READING_IN_RANGE : PROX_READING_OUT_OF_RANGE;
+}
+
+// Start a new timed period (confirmation or out-of-range) from this moment.
+void setProxState(ProximityState next, unsigned long now) {
+  if (next != proxState) {
+    Serial.printf("PROX STATE %s -> %s\n", proximityStateName(proxState),
+                  proximityStateName(next));
+  }
+  proxState = next;
+  proxAccumMs = 0;
+  proxChainValid = true;
+  proxChainAt = now;
+}
+
+// Add the time since the previous valid reading. After an unknown reading
+// the chain is broken, so the unknown gap itself is never counted.
+void proxAccumulate(unsigned long now) {
+  if (proxChainValid) proxAccumMs += now - proxChainAt;
+  proxChainValid = true;
+  proxChainAt = now;
+}
+
+void sendProximitySleepReport() {
+  digitalWrite(TFT_CS, HIGH);
+  digitalWrite(TOUCH_CS, HIGH);
+
+  radioSleeping = false;
+  LoRa.idle();
+
+  // Same layout as the manual-sleep SLP report, with mode 2.
+  LoRa.beginPacket();
+  LoRa.print("SLP,");
+  LoRa.print(DEVICE_ID);
+  LoRa.print(",2,");
+  LoRa.print(localLocationValid() ? 1 : 0);
+  LoRa.print(",");
+  LoRa.print(latitude, 6);
+  LoRa.print(",");
+  LoRa.print(longitude, 6);
+  LoRa.print(",");
+  LoRa.print(magnetometerPresent ? 1 : 0);
+  LoRa.print(",");
+  if (magnetometerPresent) LoRa.print(heading, 1);
+  else LoRa.print(-1);
+  LoRa.endPacket();
+
+  // Keep listening for the rest of the window; serviceProximitySleep()
+  // puts the radio to sleep when the window closes.
+  LoRa.receive();
+}
+
+void enterProximitySleep() {
+  proxSleepActive = true;
+  remote[DEVICE_ID].asleep = true;
+  proxLastReportCycle = 0xFFFFFFFFUL;
+  proxLastUnsyncedReport = millis();
+  // Announce immediately so awake peers know this silence is intentional.
+  sendProximitySleepReport();
+  if (proxOfflineDevice) {
+    Serial.printf("PROXIMITY SLEEP ENABLED (LORA #%d offline, left awake for recovery)\n",
+                  proxOfflineDevice);
+  } else {
+    Serial.println("PROXIMITY SLEEP ENABLED (group within threshold)");
+  }
+}
+
+void exitProximitySleep() {
+  proxSleepActive = false;
+  radioSleeping = false;
+  LoRa.idle();
+  remote[DEVICE_ID].asleep = false;
+
+  // Same wake-up path as leaving manual sleep: announce, then resync.
+  sendHeartbeat();
+  requestStatusSync();
+  nextHeartbeat = millis() + HEARTBEAT_INTERVAL;
+  Serial.println("PROXIMITY SLEEP DISABLED - 60 s CONTINUOUSLY OUT OF RANGE");
+}
+
+void updateProximity() {
+  unsigned long now = millis();
+  if (now - proxLastEvalAt < PROX_EVAL_INTERVAL_MS) return;
+  proxLastEvalAt = now;
+
+  // Manual sleep has priority; the proximity machine stands aside.
+  if (sleepMode) {
+    proxSleepActive = false;
+    if (proxState != PROX_NORMAL_OPERATION) setProxState(PROX_NORMAL_OPERATION, now);
+    return;
+  }
+
+  float d[3];
+  int offlineDevice = 0;
+  ProximityReading reading = evaluateGroupProximity(offlineDevice, d);
+  proxOfflineDevice = offlineDevice;
+
+  if (reading != proxLastReading || now - proxLastLogAt >= 10000UL) {
+    proxLastLogAt = now;
+    Serial.printf("PROX CHECK reading=%s state=%s d_a=%.1f d_b=%.1f d_ab=%.1f offline=%d accum_ms=%lu\n",
+                  reading == PROX_READING_IN_RANGE ? "IN_RANGE"
+                    : (reading == PROX_READING_OUT_OF_RANGE ? "OUT_OF_RANGE" : "UNKNOWN"),
+                  proximityStateName(proxState), d[0], d[1], d[2], offlineDevice,
+                  proxAccumMs);
+  }
+  proxLastReading = reading;
+
+  // Missing/stale GPS: pause. Keep the sleep state and the accumulated time,
+  // but do not count the unknown period.
+  if (reading == PROX_READING_UNKNOWN) {
+    if (proxState != PROX_UNKNOWN) {
+      Serial.printf("PROX STATE %s -> PROXIMITY_UNKNOWN (paused)\n",
+                    proximityStateName(proxState));
+      proxStateBeforeUnknown = proxState;
+      proxState = PROX_UNKNOWN;
+    }
+    proxChainValid = false;
+    return;
+  }
+  if (proxState == PROX_UNKNOWN) {
+    Serial.printf("PROX STATE PROXIMITY_UNKNOWN -> %s (resumed)\n",
+                  proximityStateName(proxStateBeforeUnknown));
+    proxState = proxStateBeforeUnknown;
+  }
+
+  bool inRange = (reading == PROX_READING_IN_RANGE);
+
+  switch (proxState) {
+    case PROX_NORMAL_OPERATION:
+      if (inRange) setProxState(PROX_CONFIRMATION, now);
+      break;
+
+    case PROX_CONFIRMATION:
+      if (!inRange) {
+        setProxState(PROX_NORMAL_OPERATION, now);
+        break;
+      }
+      proxAccumulate(now);
+      if (proxAccumMs >= PROX_ENTRY_CONFIRM_MS) {
+        enterProximitySleep();
+        setProxState(PROX_SLEEP, now);
+      }
+      break;
+
+    case PROX_SLEEP:
+      // First valid out-of-range reading starts the 60 s continuous timer.
+      if (!inRange) setProxState(PROX_OUT_OF_RANGE_MONITORING, now);
+      break;
+
+    case PROX_OUT_OF_RANGE_MONITORING:
+      if (inRange) {
+        // Back together before 60 s: cancel the timer, stay asleep.
+        setProxState(PROX_SLEEP, now);
+        break;
+      }
+      proxAccumulate(now);
+      if (proxAccumMs >= PROX_EXIT_OUT_OF_RANGE_MS) {
+        exitProximitySleep();
+        setProxState(PROX_WAKE_AND_RECOVERY, now);
+        proxRecoveryUntil = now + PROX_RECOVERY_HOLD_MS;
+      }
+      break;
+
+    case PROX_WAKE_AND_RECOVERY:
+      if ((long)(now - proxRecoveryUntil) >= 0) setProxState(PROX_NORMAL_OPERATION, now);
+      break;
+
+    case PROX_UNKNOWN:
+      break;
+  }
+}
+
+// Radio duty cycle for proximity sleep, called every loop.
+void serviceProximitySleep() {
+  if (sleepMode) return;   // manual sleep manages the radio itself
+
+  uint32_t utcMs = 0;
+  bool synced = gpsUtcMillisOfDay(utcMs);
+  uint32_t cycle = utcMs / PROX_CYCLE_MS;
+  uint32_t pos = utcMs % PROX_CYCLE_MS;
+
+  if (proxSleepActive) {
+    if (!synced) {
+      // Without GPS time the devices cannot share a listening window, so the
+      // radio stays on (no saving, but no peer is missed) and reports on a
+      // local timer.
+      if (radioSleeping) {
+        radioSleeping = false;
+        LoRa.idle();
+        LoRa.receive();
+      }
+      if (millis() - proxLastUnsyncedReport >= PROX_UNSYNCED_REPORT_MS) {
+        proxLastUnsyncedReport = millis();
+        sendProximitySleepReport();
+      }
+      return;
+    }
+
+    if (pos < PROX_WINDOW_MS) {
+      if (radioSleeping) {
+        radioSleeping = false;
+        LoRa.idle();
+        LoRa.receive();
+      }
+      if (cycle != proxLastReportCycle && pos >= proxSlotOffset()) {
+        proxLastReportCycle = cycle;
+        sendProximitySleepReport();
+      }
+    } else if (!radioSleeping) {
+      digitalWrite(TFT_CS, HIGH);
+      digitalWrite(TOUCH_CS, HIGH);
+      LoRa.sleep();
+      radioSleeping = true;
+    }
+    return;
+  }
+
+  // Awake device with a peer in proximity sleep: put one heartbeat inside
+  // the shared window (in this device's slot) so the sleeping peer receives
+  // this device's position every cycle.
+  if (synced && anyPeerInProximitySleep() &&
+      pos >= proxSlotOffset() && pos < PROX_WINDOW_MS &&
+      cycle != proxLastSlotHeartbeatCycle) {
+    proxLastSlotHeartbeatCycle = cycle;
+    sendHeartbeat();
   }
 }
 
@@ -1868,7 +2343,8 @@ void updateMainMenuDynamic(bool force) {
     lastMainPing = showPing;
   }
 
-  String sleepText = sleepMode ? "SLEEP MODE IS ENABLED!" : "";
+  String sleepText = sleepMode ? "SLEEP MODE IS ENABLED!"
+                   : (proxSleepActive ? "AUTO SLEEP: GROUP IS NEARBY" : "");
   if (force || sleepText != lastMainSleepMessage) {
     drawSleepModeArea(sleepText);
     lastMainSleepMessage = sleepText;
@@ -2068,6 +2544,11 @@ void updatePeerCardinals(bool force) {
 
 void erasePeerDot(int id) {
   if (!lastPeerDot[id].valid) return;
+  if (lastPeerDot[id].tickValid) {
+    tft.drawLine(lastPeerDot[id].x, lastPeerDot[id].y,
+                 lastPeerDot[id].tickX, lastPeerDot[id].tickY, BLACK);
+    lastPeerDot[id].tickValid = false;
+  }
   tft.fillCircle(lastPeerDot[id].x, lastPeerDot[id].y, 4, BLACK);
   lastPeerDot[id].valid = false;
 }
@@ -2097,6 +2578,25 @@ void drawPeerDot(int deviceId, double peerLat, double peerLon, uint16_t color) {
   lastPeerDot[deviceId].x = x;
   lastPeerDot[deviceId].y = y;
   lastPeerDot[deviceId].color = color;
+
+  // Facing tick: the peer's own compass heading, rotated by this device's
+  // heading like everything else on the radar. It only shows which way the
+  // peer faces; the dot's position comes from GPS bearing and distance.
+  lastPeerDot[deviceId].tickValid = false;
+  if (remoteHeadingCurrent(deviceId)) {
+    float facing = normalizeBearing(remote[deviceId].remoteHeading - heading) * PI / 180.0f;
+    int tx = x + (int)roundf(sinf(facing) * PEER_HEADING_TICK_LEN);
+    int ty = y - (int)roundf(cosf(facing) * PEER_HEADING_TICK_LEN);
+    tft.drawLine(x, y, tx, ty, color);
+    lastPeerDot[deviceId].tickValid = true;
+    lastPeerDot[deviceId].tickX = tx;
+    lastPeerDot[deviceId].tickY = ty;
+  }
+}
+
+int remoteHeadingStep(int deviceId) {
+  if (!remoteHeadingCurrent(deviceId)) return -1;
+  return ((int)roundf(remote[deviceId].remoteHeading / 5.0f)) % 72;
 }
 
 void clearPeerDynamicObjects() {
@@ -2124,6 +2624,11 @@ void redrawPeerDynamicObjects() {
       drawPeerDot(i, remote[i].lat, remote[i].lon, deviceColor(i));
     }
   }
+
+  // A facing tick that points toward the centre can reach the centre dot;
+  // draw the centre dot again on top.
+  tft.fillCircle(PEER_CIRCLE_CENTER_X, PEER_CIRCLE_CENTER_Y,
+                 3, deviceColor(DEVICE_ID));
 
   peerVisualInitialized = true;
 }
@@ -2236,6 +2741,9 @@ void updatePeerLocationDynamic(bool force) {
     remoteLocationFresh(1) != lastPeerGpsFresh[1] ||
     remoteLocationFresh(2) != lastPeerGpsFresh[2] ||
     remoteLocationFresh(3) != lastPeerGpsFresh[3] ||
+    remoteHeadingStep(1) != lastPeerRemoteHeadingStep[1] ||
+    remoteHeadingStep(2) != lastPeerRemoteHeadingStep[2] ||
+    remoteHeadingStep(3) != lastPeerRemoteHeadingStep[3] ||
     (gpsHasFix && (fabs(latitude - lastPeerOwnLat) > 0.0000001 || fabs(longitude - lastPeerOwnLon) > 0.0000001)) ||
     remote[1].online != lastPeer1Online || remote[1].asleep != lastPeer1Asleep || remote[1].gpsValid != lastPeer1Gps ||
     fabs(remote[1].lat - lastPeer1Lat) > 0.0000001 ||
@@ -2274,6 +2782,7 @@ void updatePeerLocationDynamic(bool force) {
     lastPeerOwnLat = latitude;
     lastPeerOwnLon = longitude;
     for (int id = 1; id <= 3; ++id) lastPeerGpsFresh[id] = remoteLocationFresh(id);
+    for (int id = 1; id <= 3; ++id) lastPeerRemoteHeadingStep[id] = remoteHeadingStep(id);
   }
 
   updatePeerDynamicText(locationText, locationOk, headingText, headingOk);
@@ -2840,7 +3349,7 @@ void handlePacketTest(const String &packet) {
 // so the other devices don't mark this one OFFLINE.
 void serviceRadio() {
   receiveLoRa();
-  if (!sleepMode && (long)(millis() - nextHeartbeat) >= 0) {
+  if (!sleepMode && !proxSleepActive && (long)(millis() - nextHeartbeat) >= 0) {
     sendHeartbeat();
     nextHeartbeat = millis() + HEARTBEAT_INTERVAL;
   }
@@ -2885,7 +3394,7 @@ void printPacketTestCsv() {
 }
 
 void runPacketTest() {
-  if (sleepMode) {
+  if (sleepMode || proxSleepActive) {
     pingMessage = "Turn off SLEEP MODE to test";
     pingMessageTime = millis();
     return;
@@ -3055,13 +3564,16 @@ void loop() {
   updatePing();
   updateDeviceStatus();
   processTouch();
+  updateProximity();
+  serviceProximitySleep();
 
   if (sleepMode) {
     if ((long)(millis() - nextSleepLocationReport) >= 0) {
       sendSleepLocationReport();
       nextSleepLocationReport = millis() + SLEEP_LOCATION_INTERVAL;
     }
-  } else {
+  } else if (!proxSleepActive) {
+    // In proximity sleep, reports are sent by serviceProximitySleep().
     if ((long)(millis() - nextHeartbeat) >= 0) {
       sendHeartbeat();
       nextHeartbeat = millis() + HEARTBEAT_INTERVAL;
