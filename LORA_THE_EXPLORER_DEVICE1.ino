@@ -1,6 +1,6 @@
-// Current Version: v2.1.2.2
-// Fixed devices missing packets: peers shown OFFLINE while online and pings reporting "did not reply" although the other device received them.
-// Radio now stays in continuous receive: packets are detected on the DIO0 pin instead of polling LoRa.parsePacket(), which switched the radio to single receive (aborting packets in flight and going deaf ~100 ms later during screen redraws); ping ACKs now refresh the responder's online status; regular heartbeats get 0-300 ms random jitter so two devices cannot stay in step and collide.
+// Current Version: v2.1.3.3
+// Fixed targeted pings showing "did not reply" although the peer received them, and ping times that included screen-redraw delays.
+// The radio now keeps listening for the reply while a ping is pending (proximity sleep and manual sleep used to switch it off right after sending) and this device's heartbeat waits until the ping is answered; round trips are timed from the DIO0 interrupt instead of when the loop noticed the reply; broadcast shows each device's round trip (slot removed) instead of the 1.2 s window; the receiver's figure is labelled "replied in"; a sleeping target shows "is asleep, no reply".
 
 #include <Arduino.h>
 #include <SPI.h>
@@ -119,6 +119,8 @@ String directionLong = "North";
 #define LIGHTGREEN  0x7ECA
 #define LIGHTBLUE   0xE0C3
 #define LOCATION_GREEN 0xFF47
+// Automatic proximity sleep (manual sleep stays YELLOW).
+#define AQUA        0x07FF
 
 // =====================================================
 // SCREEN
@@ -145,6 +147,60 @@ Screen currentScreen = MAIN_MENU;
 double latitude = 0.0;
 double longitude = 0.0;
 bool gpsHasFix = false;
+
+// Position smoothing: while the device stands still, latitude/longitude are
+// the average of the last GPS_SMOOTH_SAMPLES fixes (1 per second), which
+// removes second-to-second jumps. Moving faster than GPS_SMOOTH_MAX_SPEED_MPS
+// narrows the average to the last GPS_SMOOTH_MOVING_SAMPLES fixes (so a
+// walking user is not shown lagging behind) instead of dropping it: the old
+// restart showed one raw, jumpy fix whenever the GPS speed read above 1 m/s,
+// which NEO-6M speed noise does even when standing still. Back to the full
+// average below GPS_SMOOTH_STILL_SPEED_MPS. A single fix farther than
+// GPS_SMOOTH_JUMP_M from the average is a GPS glitch and is ignored; only
+// GPS_SMOOTH_JUMP_CONFIRM such fixes in a row restart the average.
+#define GPS_SMOOTH_SAMPLES        10
+#define GPS_SMOOTH_MOVING_SAMPLES 3
+#define GPS_SMOOTH_MAX_SPEED_MPS  1.0f
+#define GPS_SMOOTH_STILL_SPEED_MPS 0.5f
+#define GPS_SMOOTH_JUMP_M         15.0
+#define GPS_SMOOTH_JUMP_CONFIRM   3
+double gpsSmoothLat[GPS_SMOOTH_SAMPLES];
+double gpsSmoothLon[GPS_SMOOTH_SAMPLES];
+int gpsSmoothCount = 0;
+int gpsSmoothNext = 0;
+bool gpsSmoothMoving = false;
+int gpsSmoothFarFixes = 0;
+
+// Distance calibration ("zeroing"): with the devices side by side, the GPS
+// offset to each peer (which should be 0 m) is measured and subtracted from
+// later distances and directions, and the GPS wander seen during the 30 s
+// becomes a noise floor: readings within it are pulled toward 0 m, fading
+// out by DIST_ZERO_TAPER_M, so devices together read ~0 m and the distance
+// rises as they separate. Saved in flash; it stays until recalibrated.
+#define DIST_CAL_TIME_MS            30000UL
+#define DIST_CAL_MIN_OWN_SAMPLES    10
+#define DIST_CAL_MIN_PEER_SAMPLES   3
+// An offset larger than this means the devices were not together (or a fix
+// was bad), so it is refused instead of applied.
+#define DIST_CAL_MAX_OFFSET_M       60.0f
+// Noise floor = 2 x the RMS wander measured during calibration, limited to
+// this range (a 30 s sample underestimates slower GPS drift, hence the minimum).
+#define DIST_NOISE_FLOOR_MIN_M      5.0f
+#define DIST_NOISE_FLOOR_MAX_M      8.0f
+// Above this distance readings are not adjusted at all.
+#define DIST_ZERO_TAPER_M           30.0f
+// Below this shown distance the bearing is GPS noise, so "--" is shown.
+#define PEER_BEARING_MIN_DISPLAY_M  2.0f
+// Fastest the shown distance to a peer may change, in m/s (brisk walking
+// apart). A GPS jump is shown as a short ramp instead of an instant leap.
+#define DIST_DISPLAY_MAX_RATE_MPS   2.0f
+struct DistanceCalibration {
+  bool valid = false;
+  float north = 0.0f;   // metres; peer's apparent offset when side by side
+  float east = 0.0f;
+  float noiseFloor = 0.0f;   // metres
+};
+DistanceCalibration distCal[4];
 
 int gpsHour = 0;
 int gpsMinute = 0;
@@ -247,6 +303,10 @@ bool cachedRemoteAsleep[4] = {false, false, false, false};
 // Note: the thesis text specifies 50 m; this build uses 10 m as requested.
 #define PROX_THRESHOLD_M           10.0f
 #define PROX_ENTRY_CONFIRM_MS      30000UL
+// During the 30 s entry confirmation, brief out-of-range readings (GPS
+// jumps) are not counted but do not restart it; only this much continuous
+// out-of-range time does.
+#define PROX_ENTRY_TOLERANCE_MS    10000UL
 #define PROX_EXIT_OUT_OF_RANGE_MS  60000UL
 #define PROX_EVAL_INTERVAL_MS      2000UL
 // Peer coordinates older than this are not used for a proximity decision.
@@ -290,6 +350,9 @@ unsigned long proxLastEvalAt = 0;
 unsigned long proxAccumMs = 0;
 // proxChainValid is false after an unknown reading, so the gap is not counted.
 bool proxChainValid = false;
+// Start of the current out-of-range run during entry confirmation.
+bool proxEntryOutActive = false;
+unsigned long proxEntryOutSince = 0;
 unsigned long proxChainAt = 0;
 unsigned long proxRecoveryUntil = 0;
 int proxOfflineDevice = 0;
@@ -321,6 +384,8 @@ uint16_t pendingPingSequence = 0;
 unsigned long pendingPingStartedAt = 0;
 bool broadcastAckSeen[4] = {false, false, false, false};
 uint8_t broadcastAckCount = 0;
+// Round trip per broadcast responder, with its reply slot taken out.
+unsigned long broadcastAckRtt[4] = {0, 0, 0, 0};
 // Broadcast pings are acknowledged later, in this device's own time slot,
 // so the replies from two receivers do not collide on air.
 struct ScheduledPingAck {
@@ -405,6 +470,7 @@ void updatePeerLocationDynamic(bool force);
 void processTouch();
 void loadMagCalibration();
 void runMagCalibration();
+void serviceRadio();
 void loadTouchCalibration();
 void runTouchCalibration();
 
@@ -463,6 +529,23 @@ bool gpsUtcMillisOfDay(uint32_t &msOfDay);
 const char *proximityStateName(ProximityState state);
 void logPeerMeasurement(int deviceId, float bearing, float distance);
 int relativeBearingDegrees(double peerLat, double peerLon);
+
+void addSmoothedFix(double lat, double lon);
+void offsetMeters(double fromLat, double fromLon, double toLat, double toLon,
+                  float &north, float &east);
+bool distCalActive(int deviceId);
+bool peerOffsetMeters(int deviceId, float &north, float &east);
+float peerDistance(int deviceId);
+float peerBearing(int deviceId);
+int peerRelativeBearingDegrees(int deviceId);
+float peerPairDistance(int idA, int idB);
+float applyZeroFloor(float distance, float noiseFloor);
+float peerDisplayDistance(int deviceId);
+float peerPairDisplayDistance(int idA, int idB);
+String peerRowText(int deviceId);
+void loadDistanceCalibration();
+void saveDistanceCalibration();
+void runDistanceCalibration();
 bool parsePingSequence(const String &text, uint16_t &sequence);
 void drawPeerDot(int deviceId, double peerLat, double peerLon, uint16_t color);
 
@@ -663,9 +746,11 @@ String lastMainPing = "";
 String lastMainSleepMessage = "";
 bool lastMainOnline[4] = {false, false, false, false};
 bool lastMainAsleep[4] = {false, false, false, false};
+bool lastMainProximitySleep[4] = {false, false, false, false};
 
 String lastPeerLocationText = "";
 String lastPeerHeadingText = "";
+String lastPeerCalText = "";
 String lastPeerDistance2 = "";
 String lastPeerDistance3 = "";
 String lastPeerDistanceDisplay[4] = {"", "", "", ""};
@@ -754,13 +839,37 @@ void updateGPS() {
     gps.encode(gpsSerial.read());
   }
 
-  if (gps.location.isValid() && gps.location.age() <= 5000UL &&
-      validCoordinates(gps.location.lat(), gps.location.lng())) {
-    latitude = gps.location.lat();
-    longitude = gps.location.lng();
+  // GPS diagnostics every 5 s, to tell wiring, data loss and sky view apart:
+  //  chars not increasing     -> no data: check GPS power and TX/RX wiring
+  //  bad_csum increasing      -> data is arriving damaged (lost bytes/noise)
+  //  sats 0-3, no fix         -> data is fine; the module cannot see enough
+  //                              satellites (indoors, antenna, cold start)
+  static unsigned long lastGpsStat = 0;
+  if (millis() - lastGpsStat >= 5000UL) {
+    lastGpsStat = millis();
+    Serial.printf("GPS STAT chars=%lu ok_sentences=%lu bad_csum=%lu fix_sentences=%lu sats=%lu hdop=%.1f fix=%d loc_age_ms=%ld\n",
+                  (unsigned long)gps.charsProcessed(),
+                  (unsigned long)gps.passedChecksum(),
+                  (unsigned long)gps.failedChecksum(),
+                  (unsigned long)gps.sentencesWithFix(),
+                  gps.satellites.isValid() ? (unsigned long)gps.satellites.value() : 0UL,
+                  gps.hdop.isValid() ? gps.hdop.hdop() : 99.9,
+                  gps.location.isValid() ? 1 : 0,
+                  gps.location.isValid() ? (long)gps.location.age() : -1L);
+  }
+
+  bool fixFresh = gps.location.isValid() && gps.location.age() <= 5000UL;
+  // isUpdated() must be read before lat()/lng(), which clear it.
+  bool newFix = fixFresh && gps.location.isUpdated();
+  double rawLat = fixFresh ? gps.location.lat() : 0.0;
+  double rawLon = fixFresh ? gps.location.lng() : 0.0;
+  if (fixFresh && validCoordinates(rawLat, rawLon)) {
+    if (newFix || !gpsHasFix) addSmoothedFix(rawLat, rawLon);
     gpsHasFix = true;
   } else {
     gpsHasFix = false;
+    gpsSmoothCount = 0;     // restart averaging after a lost fix
+    gpsSmoothNext = 0;
   }
 
   if (gps.time.isValid()) {
@@ -850,18 +959,208 @@ void logPeerMeasurement(int deviceId, float bearing, float distance) {
   // bearing_deg = geographic bearing from this device to the peer;
   // rel_deg = bearing relative to where this device is facing (radar angle);
   // peer_hdg = the direction the peer itself faces (-1 = not current).
-  Serial.printf("GPS DIST local=%d %.6f,%.6f fix=%d hdg=%.1f peer=%d %.6f,%.6f fix=%d age_ms=%lu bearing_deg=%.1f rel_deg=%.1f distance_m=%.1f peer_hdg=%.1f\n",
+  // distance_m / bearing_deg have the calibration offset applied when
+  // dist_cal=1; shown_m is the zeroed value on screen; raw_m is the
+  // uncorrected GPS distance for comparison.
+  Serial.printf("GPS DIST local=%d %.6f,%.6f fix=%d hdg=%.1f peer=%d %.6f,%.6f fix=%d age_ms=%lu bearing_deg=%.1f rel_deg=%.1f distance_m=%.1f peer_hdg=%.1f dist_cal=%d shown_m=%.1f raw_m=%.1f\n",
                 DEVICE_ID, latitude, longitude, localLocationValid(), heading, deviceId,
                 remote[deviceId].lat, remote[deviceId].lon,
                 remoteLocationFresh(deviceId),
                 now - remote[deviceId].locationUpdatedAt, bearing,
                 normalizeBearing(bearing - heading), distance,
-                remoteHeadingCurrent(deviceId) ? remote[deviceId].remoteHeading : -1.0f);
+                remoteHeadingCurrent(deviceId) ? remote[deviceId].remoteHeading : -1.0f,
+                distCalActive(deviceId) ? 1 : 0,
+                peerDisplayDistance(deviceId),
+                distanceToPeer(remote[deviceId].lat, remote[deviceId].lon));
 }
 
 int relativeBearingDegrees(double peerLat, double peerLon) {
   int degrees = (int)roundf(normalizeBearing(bearingToPeer(peerLat, peerLon) - heading));
   return degrees >= 360 ? 0 : degrees;
+}
+
+// ---------------------------------------------------------------------------
+// Position smoothing (see GPS_SMOOTH_*)
+// ---------------------------------------------------------------------------
+void addSmoothedFix(double lat, double lon) {
+  // Moving/still with hysteresis, so speed noise around 1 m/s doesn't flip it.
+  if (gps.speed.isValid()) {
+    float speed = gps.speed.mps();
+    if (speed > GPS_SMOOTH_MAX_SPEED_MPS) gpsSmoothMoving = true;
+    else if (speed < GPS_SMOOTH_STILL_SPEED_MPS) gpsSmoothMoving = false;
+  }
+  if (gpsSmoothCount == 0) gpsSmoothFarFixes = 0;
+  if (gpsSmoothCount > 0 &&
+      TinyGPSPlus::distanceBetween(latitude, longitude, lat, lon) > GPS_SMOOTH_JUMP_M) {
+    if (++gpsSmoothFarFixes < GPS_SMOOTH_JUMP_CONFIRM) return;   // glitch: ignore
+    gpsSmoothCount = 0;     // the jump persisted: it is real, start over here
+    gpsSmoothNext = 0;
+  }
+  gpsSmoothFarFixes = 0;
+  gpsSmoothLat[gpsSmoothNext] = lat;
+  gpsSmoothLon[gpsSmoothNext] = lon;
+  gpsSmoothNext = (gpsSmoothNext + 1) % GPS_SMOOTH_SAMPLES;
+  if (gpsSmoothCount < GPS_SMOOTH_SAMPLES) ++gpsSmoothCount;
+
+  // Average the newest fixes: all of them when still, the last few when moving.
+  int window = gpsSmoothCount;
+  if (gpsSmoothMoving && window > GPS_SMOOTH_MOVING_SAMPLES) window = GPS_SMOOTH_MOVING_SAMPLES;
+  double sumLat = 0.0, sumLon = 0.0;
+  for (int k = 0; k < window; ++k) {
+    int i = (gpsSmoothNext - 1 - k + GPS_SMOOTH_SAMPLES) % GPS_SMOOTH_SAMPLES;
+    sumLat += gpsSmoothLat[i];
+    sumLon += gpsSmoothLon[i];
+  }
+  latitude = sumLat / window;
+  longitude = sumLon / window;
+}
+
+// ---------------------------------------------------------------------------
+// Peer geometry with distance calibration applied
+// ---------------------------------------------------------------------------
+// North/east metres from one coordinate to another, using the WGS84
+// ellipsoid's local radii (the shape GPS coordinates are defined on). A
+// single-radius sphere (as in TinyGPS++) makes north-south distances ~0.5%
+// too long at Philippine latitudes. The local flat approximation is accurate
+// to well under 0.1% for the distances this system works at (a few km).
+void offsetMeters(double fromLat, double fromLon, double toLat, double toLon,
+                  float &north, float &east) {
+  const double a = 6378137.0;              // WGS84 semi-major axis (m)
+  const double e2 = 6.69437999014e-3;      // WGS84 first eccentricity squared
+  const double degToRad = PI / 180.0;
+  double midLat = (fromLat + toLat) * 0.5 * degToRad;
+  double s = sin(midLat);
+  double w = sqrt(1.0 - e2 * s * s);
+  double meridianRadius = a * (1.0 - e2) / (w * w * w);   // north-south
+  double primeVerticalRadius = a / w;                      // east-west
+  north = (float)((toLat - fromLat) * degToRad * meridianRadius);
+  east = (float)((toLon - fromLon) * degToRad * primeVerticalRadius * cos(midLat));
+}
+
+bool distCalActive(int deviceId) {
+  return deviceId >= 1 && deviceId <= 3 && distCal[deviceId].valid;
+}
+
+// Pull readings within the noise floor toward 0, fading out linearly so
+// distances at or beyond DIST_ZERO_TAPER_M are unchanged. Continuous and
+// always increasing, so moving apart always shows a growing distance.
+float applyZeroFloor(float distance, float noiseFloor) {
+  if (distance < 0.0f || noiseFloor <= 0.0f) return distance;
+  float fade = 1.0f - distance / DIST_ZERO_TAPER_M;
+  if (fade < 0.0f) fade = 0.0f;
+  float shown = distance - noiseFloor * fade;
+  return shown < 0.0f ? 0.0f : shown;
+}
+
+void loadDistanceCalibration() {
+  Preferences prefs;
+  prefs.begin("dist", true);
+  if (prefs.getBytesLength("cal") == sizeof(distCal)) {
+    prefs.getBytes("cal", distCal, sizeof(distCal));
+    for (int id = 1; id <= 3; ++id) {
+      if (distCal[id].valid) {
+        Serial.printf("Distance calibration LORA #%d: offset N=%.1f E=%.1f floor=%.1f m (saved)\n",
+                      id, distCal[id].north, distCal[id].east, distCal[id].noiseFloor);
+      }
+    }
+  } else {
+    Serial.println("Distance calibration: none saved");
+  }
+  prefs.end();
+}
+
+void saveDistanceCalibration() {
+  Preferences prefs;
+  prefs.begin("dist", false);
+  prefs.putBytes("cal", distCal, sizeof(distCal));
+  prefs.end();
+}
+
+// Vector from this device to a peer, minus that peer's calibration offset.
+bool peerOffsetMeters(int deviceId, float &north, float &east) {
+  if (!localLocationValid() || !validCoordinates(remote[deviceId].lat, remote[deviceId].lon)) {
+    return false;
+  }
+  offsetMeters(latitude, longitude, remote[deviceId].lat, remote[deviceId].lon, north, east);
+  if (distCalActive(deviceId)) {
+    north -= distCal[deviceId].north;
+    east -= distCal[deviceId].east;
+  }
+  return true;
+}
+
+float peerDistance(int deviceId) {
+  float n, e;
+  if (!peerOffsetMeters(deviceId, n, e)) return -1.0f;
+  return sqrtf(n * n + e * e);
+}
+
+// Geographic bearing to a peer: 0 = north, clockwise.
+float peerBearing(int deviceId) {
+  float n, e;
+  if (!peerOffsetMeters(deviceId, n, e)) return -1.0f;
+  return normalizeBearing(atan2f(e, n) * 180.0f / PI);
+}
+
+int peerRelativeBearingDegrees(int deviceId) {
+  int degrees = (int)roundf(normalizeBearing(peerBearing(deviceId) - heading));
+  return degrees >= 360 ? 0 : degrees;
+}
+
+// Distance between two peers, both corrected relative to this device.
+float peerPairDistance(int idA, int idB) {
+  float nA, eA, nB, eB;
+  if (!peerOffsetMeters(idA, nA, eA) || !peerOffsetMeters(idB, nB, eB)) return -1.0f;
+  float n = nA - nB, e = eA - eB;
+  return sqrtf(n * n + e * e);
+}
+
+// Distance as shown on screen and used for proximity sleep: calibrated and
+// zeroed. Without a calibration this is the plain GPS distance.
+// Changes are limited to DIST_DISPLAY_MAX_RATE_MPS, so one jumpy GPS fix
+// (either device) cannot make the distance leap; real walking is followed.
+float peerDisplayDistance(int deviceId) {
+  static float shownDistance[4] = {-1.0f, -1.0f, -1.0f, -1.0f};
+  static unsigned long shownAt[4] = {0, 0, 0, 0};
+  float d = peerDistance(deviceId);
+  if (d >= 0.0f && distCalActive(deviceId)) d = applyZeroFloor(d, distCal[deviceId].noiseFloor);
+  if (deviceId < 1 || deviceId > 3) return d;
+
+  unsigned long now = millis();
+  if (d < 0.0f || shownDistance[deviceId] < 0.0f) {
+    shownDistance[deviceId] = d;      // no position (or first reading): no ramp
+  } else {
+    float maxStep = DIST_DISPLAY_MAX_RATE_MPS * (float)(now - shownAt[deviceId]) / 1000.0f;
+    float step = d - shownDistance[deviceId];
+    if (step > maxStep) step = maxStep;
+    if (step < -maxStep) step = -maxStep;
+    shownDistance[deviceId] += step;
+  }
+  shownAt[deviceId] = now;
+  return shownDistance[deviceId];
+}
+
+// Pair distance carries both peers' GPS wander, so its floor combines both.
+float peerPairDisplayDistance(int idA, int idB) {
+  float d = peerPairDistance(idA, idB);
+  if (!distCalActive(idA) || !distCalActive(idB)) return d;
+  float fa = distCal[idA].noiseFloor, fb = distCal[idB].noiseFloor;
+  return applyZeroFloor(d, sqrtf(fa * fa + fb * fb));
+}
+
+// One device-list row: "LORA #2 | 45m away | 315°". The bearing is the
+// compass bearing from this device to the peer (0 = north, clockwise), not
+// relative to where this device faces; the radar dot shows the relative view.
+String peerRowText(int deviceId) {
+  bool positionValid = localLocationValid() && remoteLocationFresh(deviceId);
+  float shown = positionValid ? peerDisplayDistance(deviceId) : -1.0f;
+  String distanceText = positionValid ? String((int)roundf(shown)) : String("--");
+  String bearingText = (positionValid && shown >= PEER_BEARING_MIN_DISPLAY_M)
+    ? String(((int)roundf(peerBearing(deviceId))) % 360) : String("--");
+  // (char)247 renders as the degree sign in the built-in font, as in the
+  // heading line on this screen.
+  return "LORA #" + String(deviceId) + " | " + distanceText + "m away | " +
+         bearingText + String((char)247);
 }
 
 bool parsePingSequence(const String &text, uint16_t &sequence) {
@@ -1379,7 +1678,10 @@ void sendPing(int targetId) {
   pendingPingBroadcast = (targetId == 0);
   pendingPingSequence = sequence;
   broadcastAckCount = 0;
-  for (int id = 1; id <= 3; ++id) broadcastAckSeen[id] = false;
+  for (int id = 1; id <= 3; ++id) {
+    broadcastAckSeen[id] = false;
+    broadcastAckRtt[id] = 0;
+  }
   pingMessage = "Sending...";
   pingMessageTime = millis();
   if (currentScreen == MAIN_MENU) {
@@ -1393,12 +1695,11 @@ void sendPing(int targetId) {
   LoRa.print(packet);
   LoRa.endPacket();
 
-  if (sleepMode) {
-    LoRa.sleep();
-    radioSleeping = true;
-  } else {
-    LoRa.receive();
-  }
+  // Listen for the reply even in sleep mode (sleeping the radio here made
+  // every ping from a sleeping device end in "did not reply"). updatePing()
+  // puts the radio back to sleep once the ping is finished.
+  radioSleeping = false;
+  LoRa.receive();
 }
 
 void updatePing() {
@@ -1413,16 +1714,46 @@ void updatePing() {
 
   // Sender side: finish the broadcast after its collection window, or
   // release the "Sending..." lock if a targeted reply never arrived.
-  if (!pingPending) return;
+  if (!pingPending) {
+    // A ping sent during manual sleep kept the radio listening; sleep again.
+    if (sleepMode && !radioSleeping) {
+      digitalWrite(TFT_CS, HIGH);
+      digitalWrite(TOUCH_CS, HIGH);
+      LoRa.sleep();
+      radioSleeping = true;
+    }
+    return;
+  }
   unsigned long elapsed = millis() - pendingPingStartedAt;
   if (pendingPingBroadcast) {
     if (elapsed < PING_BROADCAST_WINDOW) return;
-    pingMessage = broadcastAckCount
-      ? "You pinged everyone (" + String(elapsed) + " ms)"
-      : String("No device replied");
+    // Each responder's own round trip, e.g. "Pinged all: #2 95ms, #3 102ms".
+    // (The old figure was the 1.2 s collection window, not a latency.)
+    if (broadcastAckCount) {
+      pingMessage = "Pinged all:";
+      bool first = true;
+      for (int id = 1; id <= 3; ++id) {
+        if (id == DEVICE_ID) continue;
+        pingMessage += first ? " #" : ", #";
+        first = false;
+        pingMessage += String(id) + " ";
+        pingMessage += broadcastAckSeen[id] ? String(broadcastAckRtt[id]) + "ms"
+                                            : String("no reply");
+      }
+    } else {
+      pingMessage = "No device replied";
+    }
   } else {
     if (elapsed < PING_REPLY_WINDOW) return;
-    pingMessage = "Lora #" + String(pendingPingTarget) + " did not reply";
+    // A sleeping peer's radio is off (manual) or only listens 2 s in 10 s
+    // (proximity), so say why instead of a bare "did not reply".
+    if (remote[pendingPingTarget].online && remote[pendingPingTarget].asleep) {
+      pingMessage = "Lora #" + String(pendingPingTarget) + " is asleep, no reply";
+    } else {
+      pingMessage = "Lora #" + String(pendingPingTarget) + " did not reply";
+    }
+    Serial.printf("PING NO ACK target=%d seq=%u after %lu ms\n",
+                  pendingPingTarget, pendingPingSequence, elapsed);
   }
   pingPending = false;
   pendingPingBroadcast = false;
@@ -1449,14 +1780,17 @@ void sendPingAck(int requesterId, int targetId, uint16_t sequence) {
 }
 
 // Send the ACK first, then show the notification. The receiver's figure is
-// measured on its own clock: ping received -> ACK fully transmitted
-// (LoRa.endPacket() returns only after transmission completes). For a
-// broadcast it includes this device's reply slot delay.
+// NOT the ping latency: it is this device's reply time, from the moment its
+// radio finished receiving the ping to the moment the reply finished
+// transmitting (LoRa.endPacket() returns only after transmission completes),
+// so it is mostly the reply's own airtime (~40 ms at SF7). The latency is the
+// round trip shown on the sender. For a broadcast it includes this device's
+// reply slot delay.
 void acknowledgePing(int requesterId, int targetId, uint16_t sequence,
                      unsigned long receivedAt) {
   sendPingAck(requesterId, targetId, sequence);
   unsigned long responseMs = millis() - receivedAt;
-  pingMessage = "Lora #" + String(requesterId) + " pinged you (" +
+  pingMessage = "Lora #" + String(requesterId) + " pinged you (replied in " +
                 String(responseMs) + " ms)";
   pingMessageTime = millis();
   if (currentScreen == MAIN_MENU) updateMainMenuDynamic(true);
@@ -1476,6 +1810,15 @@ void acknowledgePing(int requesterId, int targetId, uint16_t sequence,
 // called once DIO0 reports a complete packet.
 unsigned long lastDio0PacketAt = 0;
 unsigned long lastFallbackPollAt = 0;
+
+// Time the radio raised DIO0 (packet fully received), taken in an interrupt
+// so ping timing does not include however long the main loop took to notice
+// the packet (screen redraws, GPS, etc.). The ISR only stores a timestamp;
+// all SPI work stays in receiveLoRa().
+volatile unsigned long loraDio0RiseAt = 0;
+void IRAM_ATTR onLoRaDio0Rise() {
+  loraDio0RiseAt = millis();
+}
 bool dio0WarningShown = false;
 #define LORA_DIO0_FALLBACK_AFTER_MS 15000UL
 #define LORA_FALLBACK_POLL_MS       1000UL
@@ -1515,7 +1858,14 @@ void receiveLoRa() {
 
   String packet = "";
   while (LoRa.available()) packet += (char)LoRa.read();
+  // Reception time for ping timing: the DIO0 interrupt time when this packet
+  // was signalled on DIO0 (and the stamp is recent), otherwise now.
   unsigned long packetReceivedAt = millis();
+  unsigned long dio0At = loraDio0RiseAt;
+  if (viaDio0 && dio0At != 0 && (long)(packetReceivedAt - dio0At) >= 0 &&
+      packetReceivedAt - dio0At < 2000UL) {
+    packetReceivedAt = dio0At;
+  }
 
   Serial.print("LoRa RX: ");
   Serial.println(packet);
@@ -1723,22 +2073,30 @@ void receiveLoRa() {
           requester == DEVICE_ID && target == pendingPingTarget &&
           responder >= 1 && responder <= 3 && responder != DEVICE_ID &&
           sequence == pendingPingSequence) {
-        unsigned long rtt = millis() - pendingPingStartedAt;
+        // Round trip: ping transmission started -> reply fully received by
+        // the radio (interrupt time), so loop/redraw delays on this device
+        // are not counted.
+        unsigned long rtt = packetReceivedAt - pendingPingStartedAt;
+        unsigned long noticedAfter = millis() - packetReceivedAt;
         if (pendingPingBroadcast) {
           // Collect every responder once; the message is shown when the
           // broadcast window closes (see updatePing()).
           if (!broadcastAckSeen[responder]) {
             broadcastAckSeen[responder] = true;
             ++broadcastAckCount;
-            Serial.printf("PING BROADCAST ACK responder=%d seq=%u rtt_ms=%lu\n",
-                          responder, sequence, rtt);
+            // The responder waited its slot (ID x 250 ms) on purpose.
+            unsigned long slot = (unsigned long)responder * PING_BROADCAST_SLOT;
+            broadcastAckRtt[responder] = rtt > slot ? rtt - slot : 0;
+            Serial.printf("PING BROADCAST ACK responder=%d seq=%u rtt_ms=%lu (minus slot %lu ms) loop_delay_ms=%lu\n",
+                          responder, sequence, broadcastAckRtt[responder], slot, noticedAfter);
           }
         } else if (responder == pendingPingTarget) {
           pingPending = false;
           pingMessage = "You pinged Lora #" + String(responder) + " (" +
                         String(rtt) + " ms)";
           pingMessageTime = millis();
-          Serial.printf("PING RTT target=%d seq=%u rtt_ms=%lu\n", responder, sequence, rtt);
+          Serial.printf("PING RTT target=%d seq=%u rtt_ms=%lu loop_delay_ms=%lu\n",
+                        responder, sequence, rtt, noticedAfter);
           if (currentScreen == MAIN_MENU) updateMainMenuDynamic(true);
         }
       }
@@ -1798,6 +2156,8 @@ void updateDeviceStatus() {
   // Our own state is always known locally.
   remote[DEVICE_ID].online = true;
   remote[DEVICE_ID].asleep = sleepMode || proxSleepActive;
+  // Own status icon on the main menu: aqua for proximity, yellow for manual.
+  remote[DEVICE_ID].proximitySleep = proxSleepActive && !sleepMode;
 
   // While this device is sleeping, preserve the exact last-known remote
   // statuses. Do NOT let the local timeout logic turn them OFFLINE.
@@ -2020,18 +2380,17 @@ ProximityReading evaluateGroupProximity(int &offlineDevice, float distances[3]) 
     int k = offline[0] ? 1 : 0;
     offlineDevice = peers[offline[0] ? 0 : 1];
     if (!fresh[k]) return PROX_READING_UNKNOWN;
-    distances[k] = distanceToPeer(remote[peers[k]].lat, remote[peers[k]].lon);
+    distances[k] = peerDisplayDistance(peers[k]);
     return distances[k] <= PROX_THRESHOLD_M ? PROX_READING_IN_RANGE
                                             : PROX_READING_OUT_OF_RANGE;
   }
 
   // Normal case: all three pairwise distances must be within the threshold.
   if (!fresh[0] || !fresh[1]) return PROX_READING_UNKNOWN;
-  distances[0] = distanceToPeer(remote[peers[0]].lat, remote[peers[0]].lon);
-  distances[1] = distanceToPeer(remote[peers[1]].lat, remote[peers[1]].lon);
-  distances[2] = (float)TinyGPSPlus::distanceBetween(
-    remote[peers[0]].lat, remote[peers[0]].lon,
-    remote[peers[1]].lat, remote[peers[1]].lon);
+  // Calibration-corrected distances (same values as the screen shows).
+  distances[0] = peerDisplayDistance(peers[0]);
+  distances[1] = peerDisplayDistance(peers[1]);
+  distances[2] = peerPairDisplayDistance(peers[0], peers[1]);
   bool together = distances[0] <= PROX_THRESHOLD_M &&
                   distances[1] <= PROX_THRESHOLD_M &&
                   distances[2] <= PROX_THRESHOLD_M;
@@ -2048,6 +2407,7 @@ void setProxState(ProximityState next, unsigned long now) {
   proxAccumMs = 0;
   proxChainValid = true;
   proxChainAt = now;
+  proxEntryOutActive = false;
 }
 
 // Add the time since the previous valid reading. After an unknown reading
@@ -2152,6 +2512,8 @@ void updateProximity() {
       proxState = PROX_UNKNOWN;
     }
     proxChainValid = false;
+    // Missing GPS is not "out of range": it never restarts the confirmation.
+    proxEntryOutActive = false;
     return;
   }
   if (proxState == PROX_UNKNOWN) {
@@ -2169,9 +2531,19 @@ void updateProximity() {
 
     case PROX_CONFIRMATION:
       if (!inRange) {
-        setProxState(PROX_NORMAL_OPERATION, now);
+        // Out-of-range time is not counted toward the 30 s, but only a
+        // continuous out-of-range run of PROX_ENTRY_TOLERANCE_MS restarts it.
+        if (!proxEntryOutActive) {
+          proxEntryOutActive = true;
+          proxEntryOutSince = now;
+        } else if (now - proxEntryOutSince >= PROX_ENTRY_TOLERANCE_MS) {
+          setProxState(PROX_NORMAL_OPERATION, now);
+          break;
+        }
+        proxChainValid = false;
         break;
       }
+      proxEntryOutActive = false;
       proxAccumulate(now);
       if (proxAccumMs >= PROX_ENTRY_CONFIRM_MS) {
         enterProximitySleep();
@@ -2243,7 +2615,9 @@ void serviceProximitySleep() {
         proxLastReportCycle = cycle;
         sendProximitySleepReport();
       }
-    } else if (!radioSleeping) {
+    } else if (!radioSleeping && !pingPending) {
+      // (While a ping this device sent is waiting for its reply, the radio
+      // stays on; sleeping it here made the reply arrive at a deaf radio.)
       digitalWrite(TFT_CS, HIGH);
       digitalWrite(TOUCH_CS, HIGH);
       LoRa.sleep();
@@ -2303,7 +2677,7 @@ void drawMainMenu() {
       tft.setCursor(textX, 280);
       tft.print("OFFLINE");
     } else if (remote[i].asleep) {
-      tft.setTextColor(YELLOW, BLACK);
+      tft.setTextColor(remote[i].proximitySleep ? AQUA : YELLOW, BLACK);
       tft.setCursor(textX, 280);
       tft.print("ASLEEP");
     } else {
@@ -2421,7 +2795,8 @@ void updateMainMenuDynamic(bool force) {
   for (int i = 1; i <= 3; i++) {
     if (force ||
         lastMainOnline[i] != remote[i].online ||
-        lastMainAsleep[i] != remote[i].asleep) {
+        lastMainAsleep[i] != remote[i].asleep ||
+        lastMainProximitySleep[i] != remote[i].proximitySleep) {
 
       int iconX = (i == 1) ? 34 : (i == 2 ? 114 : 191);
       int textX = (i == 1) ? 23 : (i == 2 ? 103 : 178);
@@ -2439,7 +2814,8 @@ void updateMainMenuDynamic(bool force) {
         tft.setCursor(textX, 280);
         tft.print("OFFLINE");
       } else if (remote[i].asleep) {
-        tft.setTextColor(YELLOW, BLACK);
+        // Yellow = manual sleep, aqua = automatic proximity sleep.
+        tft.setTextColor(remote[i].proximitySleep ? AQUA : YELLOW, BLACK);
         tft.setCursor(textX, 280);
         tft.print("ASLEEP");
       } else {
@@ -2450,6 +2826,7 @@ void updateMainMenuDynamic(bool force) {
 
       lastMainOnline[i] = remote[i].online;
       lastMainAsleep[i] = remote[i].asleep;
+      lastMainProximitySleep[i] = remote[i].proximitySleep;
     }
   }
 }
@@ -2492,16 +2869,7 @@ void drawPeerStatic() {
 
 void drawPeerLegendLine(int deviceId, int y) {
   uint16_t color = deviceColor(deviceId);
-  bool positionValid = localLocationValid() && remoteLocationFresh(deviceId);
-  String distanceText = positionValid
-    ? String((int)roundf(distanceToPeer(remote[deviceId].lat, remote[deviceId].lon)))
-    : String("N/A");
-  // Same relative bearing the radar dot uses, shown as N/NE/E/...
-  String directionText = positionValid && magnetometerPresent
-    ? shortDirection((float)relativeBearingDegrees(remote[deviceId].lat, remote[deviceId].lon))
-    : String("--");
-  String line = "LORA #" + String(deviceId) + " | " + distanceText +
-                " meters away! | " + directionText;
+  String line = peerRowText(deviceId);
 
   tft.setTextSize(1);
   tft.setTextColor(WHITE, BLACK);
@@ -2510,8 +2878,9 @@ void drawPeerLegendLine(int deviceId, int y) {
   uint16_t w, h;
   tft.getTextBounds(line.c_str(), 0, y, &x1, &y1, &w, &h);
 
+  // Gray = offline, yellow = manual sleep, aqua = automatic proximity sleep.
   uint16_t statusColor = !remote[deviceId].online ? GRAY
-    : (remote[deviceId].asleep ? YELLOW : WHITE);
+    : (remote[deviceId].asleep ? (remote[deviceId].proximitySleep ? AQUA : YELLOW) : WHITE);
   tft.setTextColor(statusColor, BLACK);
 
   const int bulletRadius = 3;
@@ -2539,6 +2908,7 @@ void drawPeerLocation() {
 
   lastPeerLocationText = "";
   lastPeerHeadingText = "";
+  lastPeerCalText = "";
   lastPeerDistance2 = "";
   lastPeerDistance3 = "";
   for (int i = 0; i < 4; ++i) lastPeerDistanceDisplay[i] = "";
@@ -2625,14 +2995,17 @@ void drawPeerDot(int deviceId, double peerLat, double peerLon, uint16_t color) {
   if (!localLocationValid() || !magnetometerPresent ||
       !validCoordinates(peerLat, peerLon)) return;
 
-  float distance = distanceToPeer(peerLat, peerLon);
-  float geographicBearing = normalizeBearing(bearingToPeer(peerLat, peerLon));
+  // Calibration-corrected, so the dot agrees with the row text.
+  float distance = peerDistance(deviceId);
+  float geographicBearing = peerBearing(deviceId);
   float bearing = normalizeBearing(geographicBearing - heading);
   logPeerMeasurement(deviceId, geographicBearing, distance);
 
   // Fixed 100 m display scale. Closer points sit closer to the center;
-  // farther points are capped at the inside of the ring.
-  float radius = (distance / PEER_MAX_DISPLAY_METERS) * (PEER_CIRCLE_RADIUS - 8.0f);
+  // farther points are capped at the inside of the ring. Uses the zeroed
+  // distance shown in the row, so the dot and the text agree.
+  float shownDistance = peerDisplayDistance(deviceId);
+  float radius = (shownDistance / PEER_MAX_DISPLAY_METERS) * (PEER_CIRCLE_RADIUS - 8.0f);
   if (radius < 7.0f) radius = 7.0f;
   if (radius > PEER_CIRCLE_RADIUS - 8.0f) radius = PEER_CIRCLE_RADIUS - 8.0f;
 
@@ -2703,6 +3076,24 @@ void redrawPeerDynamicObjects() {
 
 void updatePeerDynamicText(const String &locationText, bool locationOk,
                            const String &headingText, bool headingOk) {
+  // "DIST CAL" top right while a distance calibration is applied (blank when
+  // none). This corner stays clear of the rotating N/E/S/W letters.
+  bool anyCal = false;
+  for (int id = 1; id <= 3; ++id) {
+    if (id != DEVICE_ID && distCalActive(id)) anyCal = true;
+  }
+  String calText = anyCal ? String("DIST CAL") : String("");
+  if (calText != lastPeerCalText) {
+    tft.fillRect(150, 8, 88, 12, BLACK);
+    if (calText.length()) {
+      tft.setTextSize(1);
+      tft.setTextColor(LIGHTGREEN, BLACK);
+      tft.setCursor(236 - (int)calText.length() * 6, 10);
+      tft.print(calText);
+    }
+    lastPeerCalText = calText;
+  }
+
   // Fixed-position clear-and-redraw, matching the TIME update style.
   // No horizontal recentering means changing digits cannot slide left/right.
   if (locationText != lastPeerLocationText) {
@@ -2750,19 +3141,13 @@ void updatePeerDynamicText(const String &locationText, bool locationOk,
     int id = ids[k];
     int y = ys[k];
 
-    String directionText = localLocationValid() && remoteLocationFresh(id) && magnetometerPresent
-      ? shortDirection((float)relativeBearingDegrees(remote[id].lat, remote[id].lon))
-      : String("--");
-    String shown = localLocationValid() && remoteLocationFresh(id)
-      ? String((int)roundf(distanceToPeer(remote[id].lat, remote[id].lon)))
-      : String("N/A");
-    String line = "LORA #" + String(id) + " | " + shown +
-                  " meters away! | " + directionText;
+    String line = peerRowText(id);
 
     // Status is no longer printed in the row, but it still sets the text
     // color (gray offline / yellow asleep), so keep it in the redraw key.
     String displayKey = line + (remote[id].online ? "|ONLINE" : "|OFFLINE") +
-                        (remote[id].asleep ? "|ASLEEP" : "|AWAKE");
+                        (remote[id].asleep ? (remote[id].proximitySleep ? "|PROXSLEEP" : "|ASLEEP")
+                                           : "|AWAKE");
 
     if (displayKey != lastPeerDistanceDisplay[id]) {
       // Clear the complete row, including the bullet, then redraw it centered.
@@ -2883,11 +3268,13 @@ void processTouch() {
   static bool wasTouched = false;
   static unsigned long lastAcceptedTouch = 0;
   static unsigned long compassHoldStart = 0;
+  static unsigned long distanceHoldStart = 0;
   bool nowTouched = touch.touched();
 
   if (!nowTouched) {
     wasTouched = false;
     compassHoldStart = 0;
+    distanceHoldStart = 0;
     return;
   }
   if (wasTouched) {
@@ -2895,6 +3282,12 @@ void processTouch() {
     if (compassHoldStart && millis() - compassHoldStart >= 3000UL) {
       compassHoldStart = 0;
       runMagCalibration();
+      drawPeerLocation();
+    }
+    // Holding the device list for 3 s starts distance calibration.
+    if (distanceHoldStart && millis() - distanceHoldStart >= 3000UL) {
+      distanceHoldStart = 0;
+      runDistanceCalibration();
       drawPeerLocation();
     }
     return;
@@ -2963,8 +3356,7 @@ void processTouch() {
         screenX <= ownIconCenterX + 14 &&
         screenY >= 248 && screenY <= 280) {
       Serial.println("BUTTON: PING ALL (OWN DEVICE ICON)");
-      sendPing(0);
-      updateMainMenuDynamic(true);
+      sendPing(0);   // sendPing() already redrew "Sending..."
       return;
     }
 
@@ -2978,8 +3370,7 @@ void processTouch() {
           screenY >= 248 && screenY <= 280) {
         Serial.print("BUTTON: PING LORA #");
         Serial.println(targetId);
-        sendPing(targetId);
-        updateMainMenuDynamic(true);
+        sendPing(targetId);   // sendPing() already redrew "Sending..."
         return;
       }
     }
@@ -2997,6 +3388,11 @@ void processTouch() {
     if (magnetometerPresent &&
         dx * dx + dy * dy <= PEER_CIRCLE_RADIUS * PEER_CIRCLE_RADIUS) {
       compassHoldStart = millis();
+    }
+
+    // Device list rows (y 291-310) start the distance-calibration hold.
+    if (screenY >= 285) {
+      distanceHoldStart = millis();
     }
   }
 }
@@ -3038,8 +3434,14 @@ void setup() {
   touch.begin();
   loadTouchCalibration();
   loadMagCalibration();
+  loadDistanceCalibration();
   if (touch.touched()) runTouchCalibration();
 
+  // The default 256-byte UART buffer holds only ~0.5 s of NMEA data (the
+  // NEO-6M sends ~500 bytes/s); a longer screen redraw overflowed it and the
+  // damaged sentences were discarded. 2048 bytes holds ~4 s. Must be set
+  // before begin().
+  gpsSerial.setRxBufferSize(2048);
   gpsSerial.begin(GPS_BAUD, SERIAL_8N1, GPS_RX, GPS_TX);
 
   LoRa.setPins(LORA_CS, LORA_RST, LORA_DIO0);
@@ -3051,6 +3453,8 @@ void setup() {
     tft.print("LORA ERROR");
     while (true) delay(1000);
   }
+  // Timestamp only (see onLoRaDio0Rise); reception itself is still polled.
+  attachInterrupt(digitalPinToInterrupt(LORA_DIO0), onLoRaDio0Rise, RISING);
 
   LoRa.setTxPower(17);
   LoRa.setSpreadingFactor(7);
@@ -3218,6 +3622,8 @@ void runTouchCalibration() {
 #define MAG_CAL_ZERO_SAMPLES 5
 // At least one full turn is needed to measure the direction reliably.
 #define MAG_CAL_MIN_TURNS 1.0f
+// Time to point the device north after the 3 s hold, before sampling starts.
+#define MAG_CAL_READY_MS 5000UL
 
 void loadMagCalibration() {
   Preferences prefs;
@@ -3251,11 +3657,33 @@ float wrapAngleDelta(float d) {
 void runMagCalibration() {
   if (!magnetometerPresent) return;
 
-  Serial.println("COMPASS CALIBRATION: start facing = 0 deg, rotate CLOCKWISE 2-3 turns");
+  Serial.println("COMPASS CALIBRATION: face NORTH, start facing = 0 deg, rotate CLOCKWISE 2-3 turns");
+
+  // The start facing becomes 0 degrees, and peers are placed on the radar
+  // by their GPS (true-north) bearing minus this heading. If the start
+  // facing is not north, every dot, the N/E/S/W letters and the bearing
+  // numbers are turned by that error. So the user points the device NORTH
+  // first; this countdown gives time to do that after the 3 s hold.
+  tft.fillScreen(BLACK);
+  drawCenteredText("COMPASS CALIBRATION", 55, WHITE, BLACK, 2);
+  drawCenteredText("Point it NORTH", 95, YELLOW, BLACK, 2);
+  drawCenteredText("(use a phone compass), keep it FLAT", 125, YELLOW, BLACK, 1);
+  unsigned long readyStart = millis();
+  int lastCount = -1;
+  while (millis() - readyStart < MAG_CAL_READY_MS) {
+    serviceRadio();   // stay ONLINE for the others while waiting
+    int count = (int)((MAG_CAL_READY_MS - (millis() - readyStart) + 999UL) / 1000UL);
+    if (count != lastCount) {
+      lastCount = count;
+      tft.fillRect(0, 175, SCREEN_W, 20, BLACK);
+      drawCenteredText("Starting in " + String(count) + " s", 180, GREEN, BLACK, 2);
+    }
+    delay(10);
+  }
 
   tft.fillScreen(BLACK);
   drawCenteredText("COMPASS CALIBRATION", 55, WHITE, BLACK, 2);
-  drawCenteredText("Current facing is now 0 degrees", 90, YELLOW, BLACK, 1);
+  drawCenteredText("North is now 0 degrees", 90, YELLOW, BLACK, 1);
   drawCenteredText("Keep the device FLAT", 110, YELLOW, BLACK, 1);
   drawCenteredText("Rotate it slowly CLOCKWISE", 125, YELLOW, BLACK, 1);
   drawCenteredText("(2-3 turns) until the timer ends", 140, YELLOW, BLACK, 1);
@@ -3286,6 +3714,8 @@ void runMagCalibration() {
 
     // Keep this device ONLINE for the others during calibration.
     receiveLoRa();
+    // Keep reading the GPS so its data is not lost during the 20 s.
+    updateGPS();
     if (millis() - lastBeat >= HEARTBEAT_INTERVAL) {
       lastBeat = millis();
       sendHeartbeat();
@@ -3398,8 +3828,9 @@ void runMagCalibration() {
 // PACKET TEST
 // Double-tap the TIME on the main menu. This device sends TEST_PACKET_COUNT
 // test packets; every awake peer echoes each one back in its own time slot
-// (so peers never collide). The result shows, per peer, how many packets
-// made the round trip, the round-trip time, and signal strength both ways.
+// (so peers never collide), and peers hold their heartbeats until it ends.
+// The result shows, per peer, how many test packets it received (one way),
+// how many replies came back, the round-trip time, and signal both ways.
 // =====================================================
 
 #define TEST_PACKET_COUNT 20
@@ -3422,8 +3853,14 @@ int packetTestId = 0;
 // doesn't start its own test at the same time (the packets would collide).
 unsigned long peerTestActiveUntil = 0;
 int peerTestDevice = 0;
+// Test packets received from the device that is testing (one-way count,
+// sent back in every reply so the tester can show the delivery rate).
+int peerTestRxCount = 0;
+int peerTestLastSeq = -1;
 unsigned long packetTestSentAt[TEST_PACKET_COUNT];
 PacketSample packetSamples[4][TEST_PACKET_COUNT];
+// Highest one-way count each peer reported in this test (-1 = not reported).
+int packetTestDelivered[4];
 
 // Each device answers in its own slot so replies from #2 and #3 don't collide.
 unsigned long packetTestReplyDelay(int id) {
@@ -3452,8 +3889,25 @@ void handlePacketTest(const String &packet) {
     int seq = packet.substring(comma + 1).toInt();
     if (sender < 1 || sender > 3 || sender == DEVICE_ID || sleepMode) return;
 
+    // A new test (other sender, earlier one finished, or sequence restarted)
+    // restarts the one-way count.
+    if (sender != peerTestDevice || (long)(peerTestActiveUntil - millis()) <= 0 ||
+        seq <= peerTestLastSeq) {
+      peerTestRxCount = 0;
+    }
+    ++peerTestRxCount;
+    peerTestLastSeq = seq;
+
     peerTestActiveUntil = millis() + 2000UL;
     peerTestDevice = sender;
+
+    // Hold this device's heartbeat until the test is over. While a heartbeat
+    // is on air this radio cannot hear the next test packet, and it collides
+    // with the other replies (a timing model puts this at ~3 of every 20).
+    // Staggered by device ID so the held heartbeats don't all go out at once.
+    unsigned long resumeAt = peerTestActiveUntil + (unsigned long)(DEVICE_ID - 1) * 250UL +
+                             (unsigned long)random(HEARTBEAT_JITTER_MS + 1);
+    if ((long)(nextHeartbeat - resumeAt) < 0) nextHeartbeat = resumeAt;
 
     // Busy with our own test: don't transmit over it.
     if (packetTestRunning) return;
@@ -3464,15 +3918,17 @@ void handlePacketTest(const String &packet) {
 
     delay(packetTestReplyDelay(DEVICE_ID));
     sendRawLoRa("TR," + String(DEVICE_ID) + "," + String(sender) + "," +
-                String(seq) + "," + String(rssi) + "," + String(snr, 1));
+                String(seq) + "," + String(rssi) + "," + String(snr, 1) + "," +
+                String(peerTestRxCount));
     return;
   }
 
-  // TR,<responder>,<to>,<seq>,<rssi>,<snr>
-  String f[5];
+  // TR,<responder>,<to>,<seq>,<rssi>,<snr>,<received>
+  // (<received> = test packets the responder got so far; older firmware omits it)
+  String f[6];
   int startIndex = 3;
   int count = 0;
-  while (count < 5) {
+  while (count < 6) {
     int comma = packet.indexOf(',', startIndex);
     if (comma < 0) {
       f[count++] = packet.substring(startIndex);
@@ -3486,13 +3942,25 @@ void handlePacketTest(const String &packet) {
   int responder = f[0].toInt();
   int to = f[1].toInt();
   int seq = f[2].toInt();
-  if (!packetTestRunning || to != DEVICE_ID) return;
   if (responder < 1 || responder > 3 || responder == DEVICE_ID) return;
-  if (seq < 0 || seq >= TEST_PACKET_COUNT || packetTestSentAt[seq] == 0) return;
 
+  // Any valid reply proves the responder is awake, even one addressed to
+  // another device: heartbeats are held during a test, so this keeps the
+  // two responders from marking each other OFFLINE.
   remote[responder].lastSeen = millis();
   remote[responder].online = true;
   cachedRemoteOnline[responder] = true;
+
+  if (!packetTestRunning || to != DEVICE_ID) return;
+  if (seq < 0 || seq >= TEST_PACKET_COUNT || packetTestSentAt[seq] == 0) return;
+
+  if (count >= 6) {
+    int delivered = f[5].toInt();
+    if (delivered >= 1 && delivered <= TEST_PACKET_COUNT &&
+        delivered > packetTestDelivered[responder]) {
+      packetTestDelivered[responder] = delivered;
+    }
+  }
 
   PacketSample &s = packetSamples[responder][seq];
   if (s.received) return;   // duplicate
@@ -3515,16 +3983,197 @@ void handlePacketTest(const String &packet) {
 // so the other devices don't mark this one OFFLINE.
 void serviceRadio() {
   receiveLoRa();
+  updateGPS();
   if (!sleepMode && !proxSleepActive && (long)(millis() - nextHeartbeat) >= 0) {
     sendHeartbeat();
     nextHeartbeat = millis() + HEARTBEAT_INTERVAL + (unsigned long)random(HEARTBEAT_JITTER_MS + 1);
   }
 }
 
+// =====================================================
+// DISTANCE CALIBRATION
+// On the CHECK LOCATION screen, hold the device list (bottom rows) for 3 s.
+// With all devices side by side, each GPS reports a slightly different
+// position; that apparent offset to each peer (which should be 0 m) is
+// averaged over 30 s and then subtracted from later distances/directions.
+// Each device calibrates its own view, so run it on every device (they can
+// run at the same time). Saved in flash; it stays until recalibrated.
+// =====================================================
+
+void runDistanceCalibration() {
+  if (sleepMode) {
+    tft.fillScreen(BLACK);
+    drawCenteredText("DISTANCE CALIBRATION", 130, WHITE, BLACK, 2);
+    drawCenteredText("Turn off SLEEP MODE first", 165, YELLOW, BLACK, 1);
+    delay(2500);
+    return;
+  }
+  // Proximity sleep only listens 2 s out of 10 s; wake fully so every peer
+  // report is heard. The proximity machine re-evaluates afterwards.
+  if (proxSleepActive) {
+    Serial.println("Waking from proximity sleep for distance calibration");
+    exitProximitySleep();
+    setProxState(PROX_WAKE_AND_RECOVERY, millis());
+    proxRecoveryUntil = millis() + PROX_RECOVERY_HOLD_MS;
+  }
+
+  Serial.println("DISTANCE CALIBRATION: devices side by side for 30 s");
+  tft.fillScreen(BLACK);
+  drawCenteredText("DISTANCE CALIBRATION", 40, WHITE, BLACK, 2);
+  drawCenteredText("Place ALL devices side by side", 80, YELLOW, BLACK, 1);
+  drawCenteredText("Keep them still, GPS facing up", 95, YELLOW, BLACK, 1);
+  drawCenteredText("Run this on every device", 110, YELLOW, BLACK, 1);
+
+  int ownCount = 0;   // seconds with a valid own fix
+  double vecN[4] = {0.0, 0.0, 0.0, 0.0};
+  double vecE[4] = {0.0, 0.0, 0.0, 0.0};
+  double vecN2[4] = {0.0, 0.0, 0.0, 0.0};
+  double vecE2[4] = {0.0, 0.0, 0.0, 0.0};
+  int peerCount[4] = {0, 0, 0, 0};
+  unsigned long lastPeerUpdate[4];
+  for (int id = 1; id <= 3; ++id) lastPeerUpdate[id] = remote[id].locationUpdatedAt;
+
+  unsigned long start = millis();
+  unsigned long lastOwnSample = 0;
+  unsigned long lastDraw = 0;
+  while (millis() - start < DIST_CAL_TIME_MS) {
+    serviceRadio();   // receive peer packets, read GPS, keep heartbeats going
+
+    // Own fix: counted once per second while valid.
+    if (localLocationValid() && millis() - lastOwnSample >= 1000UL) {
+      lastOwnSample = millis();
+      ++ownCount;
+    }
+    // Peer offset vectors: one sample per newly received valid location,
+    // measured from this device's position at that moment. Their mean is
+    // the offset to remove; their spread is the GPS wander (noise floor).
+    for (int id = 1; id <= 3; ++id) {
+      if (id == DEVICE_ID) continue;
+      if (remote[id].gpsValid && remote[id].locationUpdatedAt != lastPeerUpdate[id]) {
+        lastPeerUpdate[id] = remote[id].locationUpdatedAt;
+        if (!localLocationValid()) continue;
+        float n, e;
+        offsetMeters(latitude, longitude, remote[id].lat, remote[id].lon, n, e);
+        vecN[id] += n;
+        vecE[id] += e;
+        vecN2[id] += (double)n * n;
+        vecE2[id] += (double)e * e;
+        ++peerCount[id];
+      }
+    }
+
+    if (millis() - lastDraw >= 500UL) {
+      lastDraw = millis();
+      int secondsLeft = (int)((DIST_CAL_TIME_MS - (millis() - start) + 999UL) / 1000UL);
+      String peersText = "";
+      for (int id = 1; id <= 3; ++id) {
+        if (id == DEVICE_ID) continue;
+        if (peersText.length()) peersText += "   ";
+        peersText += "LORA #" + String(id) + ": " + String(peerCount[id]);
+      }
+      tft.fillRect(0, 140, SCREEN_W, 80, BLACK);
+      drawCenteredText(String(secondsLeft) + " s", 145, GREEN, BLACK, 2);
+      drawCenteredText("Own GPS fixes: " + String(ownCount), 180, WHITE, BLACK, 1);
+      drawCenteredText(peersText, 195, WHITE, BLACK, 1);
+    }
+    delay(5);
+  }
+
+  tft.fillScreen(BLACK);
+  drawCenteredText("DISTANCE CALIBRATION", 40, WHITE, BLACK, 2);
+
+  if (ownCount < DIST_CAL_MIN_OWN_SAMPLES) {
+    Serial.printf("DISTANCE CALIBRATION FAILED: only %d own GPS fixes\n", ownCount);
+    drawCenteredText("No GPS fix on this device", 120, RED, BLACK, 1);
+    drawCenteredText("Go outside and try again", 140, WHITE, BLACK, 1);
+    delay(3000);
+    return;
+  }
+
+  int y = 90;
+  bool anySaved = false;
+  for (int id = 1; id <= 3; ++id) {
+    if (id == DEVICE_ID) continue;
+    String line = "LORA #" + String(id) + ": ";
+    uint16_t color;
+    if (peerCount[id] < DIST_CAL_MIN_PEER_SAMPLES) {
+      line += "no location data";
+      color = GRAY;
+      Serial.printf("  LORA #%d: only %d location reports, not calibrated\n", id, peerCount[id]);
+    } else {
+      float north = (float)(vecN[id] / peerCount[id]);
+      float east = (float)(vecE[id] / peerCount[id]);
+      float varN = (float)(vecN2[id] / peerCount[id]) - north * north;
+      float varE = (float)(vecE2[id] / peerCount[id]) - east * east;
+      float wander = sqrtf(fmaxf(0.0f, varN + varE));   // RMS radius, metres
+      float floorM = constrain(2.0f * wander, DIST_NOISE_FLOOR_MIN_M, DIST_NOISE_FLOOR_MAX_M);
+      float offset = sqrtf(north * north + east * east);
+      if (offset > DIST_CAL_MAX_OFFSET_M) {
+        line += String(offset, 0) + " m apart - together?";
+        color = RED;
+        Serial.printf("  LORA #%d: offset %.1f m too large, refused\n", id, offset);
+      } else {
+        distCal[id].valid = true;
+        distCal[id].north = north;
+        distCal[id].east = east;
+        distCal[id].noiseFloor = floorM;
+        anySaved = true;
+        line += "zeroed (" + String(offset, 1) + " m offset)";
+        color = GREEN;
+        Serial.printf("  LORA #%d: offset north=%.1f east=%.1f (%.1f m), wander %.1f m -> floor %.1f m, from %d own / %d peer samples, saved\n",
+                      id, north, east, offset, wander, floorM, ownCount, peerCount[id]);
+      }
+    }
+    drawCenteredText(line, y, color, BLACK, 1);
+    y += 18;
+  }
+
+  if (anySaved) {
+    saveDistanceCalibration();
+    drawCenteredText("Saved - stays until you recalibrate", y + 12, LIGHTGREEN, BLACK, 1);
+  } else {
+    drawCenteredText("Nothing saved - previous values kept", y + 12, YELLOW, BLACK, 1);
+  }
+  delay(4000);
+}
+
 // GPS distance to a peer in meters, or -1 when either side has no GPS fix.
+// The same calibrated value the CHECK LOCATION rows show.
 float packetTestDistance(int id) {
   if (!localLocationValid() || !remoteLocationFresh(id)) return -1.0f;
-  return distanceToPeer(remote[id].lat, remote[id].lon);
+  return peerDisplayDistance(id);
+}
+
+// Plain GPS distance with no calibration applied, for comparison.
+float packetTestRawDistance(int id) {
+  if (!localLocationValid() || !remoteLocationFresh(id)) return -1.0f;
+  float n, e;
+  offsetMeters(latitude, longitude, remote[id].lat, remote[id].lon, n, e);
+  return sqrtf(n * n + e * e);
+}
+
+// Small clock at the top center of the result screen (same text size as the
+// DIST CAL label); redrawn only when the time changes.
+void drawPacketTestClock(bool force) {
+  static String lastText = "";
+  int h, mi, s, d, mo, y;
+  bool valid;
+  getDisplayClock(h, mi, s, d, mo, y, valid);
+  char buf[12];
+  if (valid) sprintf(buf, "%02d:%02d:%02d", h, mi, s);
+  else sprintf(buf, "--:--:--");
+  String text = buf;
+  if (!force && text == lastText) return;
+  lastText = text;
+  tft.fillRect(80, 2, 80, 10, BLACK);
+  drawCenteredText(text, 3, YELLOW, BLACK, 1);
+}
+
+// While the result screen waits for a tap: radio, GPS, heartbeats, clock.
+void packetTestResultIdle() {
+  serviceRadio();
+  drawPacketTestClock(false);
+  delay(5);
 }
 
 String csvDistance(float meters) {
@@ -3533,7 +4182,10 @@ String csvDistance(float meters) {
 
 // Serial CSV output (saved on the PC by tools/packet_logger.py):
 // CSV,device,test,seq,peer,status,rtt_ms,rssi_here,snr_here,rssi_there,snr_there,distance_m,own_lat,own_lon,peer_lat,peer_lon
-// SUM,device,test,peer,received,sent,success_pct,avg_rtt_ms,avg_rssi_here,avg_snr_here,avg_rssi_there,avg_snr_there,distance_m
+// SUM,device,test,peer,received,sent,success_pct,avg_rtt_ms,avg_rssi_here,avg_snr_here,avg_rssi_there,avg_snr_there,distance_m,delivered,delivered_pct,raw_distance_m
+// received/success_pct = round trips (packet there AND reply back);
+// delivered/delivered_pct = packets the peer received (one way, the thesis
+// packet success rate; blank if the peer runs older firmware).
 void printPacketTestCsv() {
   for (int id = 1; id <= 3; id++) {
     if (id == DEVICE_ID) continue;
@@ -3579,6 +4231,7 @@ void runPacketTest() {
   unsigned long listenFor = 300UL + (unsigned long)random(400);
   while (millis() - listenStart < listenFor) {
     receiveLoRa();
+    updateGPS();
     delay(1);
   }
   if ((long)(peerTestActiveUntil - millis()) > 0) {
@@ -3591,6 +4244,7 @@ void runPacketTest() {
   packetTestId++;
   memset(packetSamples, 0, sizeof(packetSamples));
   memset(packetTestSentAt, 0, sizeof(packetTestSentAt));
+  for (int id = 0; id <= 3; id++) packetTestDelivered[id] = -1;
 
   tft.fillScreen(BLACK);
   drawCenteredText("PACKET TEST", 20, WHITE, BLACK, 2);
@@ -3605,6 +4259,7 @@ void runPacketTest() {
 
     while (millis() - packetTestSentAt[seq] < TEST_PACKET_INTERVAL) {
       receiveLoRa();
+      updateGPS();
       delay(1);
     }
 
@@ -3616,6 +4271,7 @@ void runPacketTest() {
   unsigned long graceStart = millis();
   while (millis() - graceStart < TEST_PACKET_INTERVAL) {
     receiveLoRa();
+    updateGPS();
     delay(1);
   }
 
@@ -3626,7 +4282,9 @@ void runPacketTest() {
 
   // ---- Results ----
   tft.fillScreen(BLACK);
+  drawPacketTestClock(true);
   drawCenteredText("PACKET TEST RESULT", 15, WHITE, BLACK, 2);
+  drawCenteredText("Packets received by each device", 34, GRAY, BLACK, 1);
 
   int y = 45;
   bool anyReply = false;
@@ -3649,16 +4307,34 @@ void runPacketTest() {
     }
     int pct = (received * 100) / TEST_PACKET_COUNT;
     float distance = packetTestDistance(id);
+    float rawDistance = packetTestRawDistance(id);
 
-    uint16_t color = pct >= 90 ? GREEN : (pct >= 50 ? YELLOW : RED);
+    // Headline = packets this peer received (one way), as in the thesis
+    // packet success rate. Every reply proves its packet arrived, so it is
+    // never below the round-trip count. Older peers don't report it: then
+    // the round-trip count is shown.
+    int delivered = packetTestDelivered[id];
+    bool oneWay = delivered >= 0;
+    if (oneWay && delivered < received) delivered = received;
+    int shownCount = oneWay ? delivered : received;
+    int shownPct = (shownCount * 100) / TEST_PACKET_COUNT;
+
+    uint16_t color = shownPct >= 90 ? GREEN : (shownPct >= 50 ? YELLOW : RED);
     if (received == 0) color = GRAY;
 
-    drawCenteredText("LORA #" + String(id) + ": " + String(received) + "/" +
-                     String(TEST_PACKET_COUNT) + " (" + String(pct) + "%)",
+    drawCenteredText("LORA #" + String(id) + ": " + String(shownCount) + "/" +
+                     String(TEST_PACKET_COUNT) + " (" + String(shownPct) + "%)",
                      y, color, BLACK, 2);
 
-    String distText = distance < 0 ? String("Distance: no GPS fix")
-                                   : "Distance: " + String((int)roundf(distance)) + " m (GPS)";
+    String distText;
+    if (distance < 0) {
+      distText = "Distance: no GPS fix";
+    } else if (distCalActive(id)) {
+      distText = "Distance: " + String((int)roundf(distance)) + " m (GPS, raw " +
+                 String((int)roundf(rawDistance)) + " m)";
+    } else {
+      distText = "Distance: " + String((int)roundf(distance)) + " m (GPS, not calibrated)";
+    }
 
     String sum = "SUM," + String(DEVICE_ID) + "," + String(packetTestId) + "," +
                  String(id) + "," + String(received) + "," + String(TEST_PACKET_COUNT) + "," +
@@ -3666,8 +4342,11 @@ void runPacketTest() {
 
     if (received > 0) {
       anyReply = true;
-      drawCenteredText("Avg round trip: " + String(rttSum / received) + " ms",
-                       y + 25, WHITE, BLACK, 1);
+      String rttText = oneWay
+        ? "Replies back: " + String(received) + "/" + String(TEST_PACKET_COUNT) +
+          ", avg " + String(rttSum / received) + " ms"
+        : "Round trip only, avg " + String(rttSum / received) + " ms";
+      drawCenteredText(rttText, y + 25, WHITE, BLACK, 1);
       drawCenteredText("Signal here:  " + String(rssiHereSum / received) + " dBm, SNR " +
                        String(snrHereSum / received, 1) + " dB",
                        y + 40, WHITE, BLACK, 1);
@@ -3682,7 +4361,9 @@ void runPacketTest() {
       sum += ",,,,,";
     }
     drawCenteredText(distText, y + 70, distance < 0 ? GRAY : LOCATION_GREEN, BLACK, 1);
-    sum += csvDistance(distance);
+    sum += csvDistance(distance) + ",";
+    sum += oneWay ? String(delivered) + "," + String(shownPct) + "," : String(",,");
+    sum += csvDistance(rawDistance);
     Serial.println(sum);
 
     y += 100;
@@ -3696,9 +4377,9 @@ void runPacketTest() {
 
   // Wait for the finger to lift, then for a new tap (or 30 s).
   unsigned long shownAt = millis();
-  while (touch.touched() && millis() - shownAt < 30000UL) { serviceRadio(); delay(5); }
-  while (!touch.touched() && millis() - shownAt < 30000UL) { serviceRadio(); delay(5); }
-  while (touch.touched() && millis() - shownAt < 31000UL) { serviceRadio(); delay(5); }
+  while (touch.touched() && millis() - shownAt < 30000UL) packetTestResultIdle();
+  while (!touch.touched() && millis() - shownAt < 30000UL) packetTestResultIdle();
+  while (touch.touched() && millis() - shownAt < 31000UL) packetTestResultIdle();
 }
 
 // If the display controller lost its setup (power dip, glitch on the SPI
@@ -3740,7 +4421,9 @@ void loop() {
     }
   } else if (!proxSleepActive) {
     // In proximity sleep, reports are sent by serviceProximitySleep().
-    if ((long)(millis() - nextHeartbeat) >= 0) {
+    // Held while a ping waits for its reply (at most PING_REPLY_WINDOW): a
+    // heartbeat on air would make this radio deaf to the reply.
+    if ((long)(millis() - nextHeartbeat) >= 0 && !pingPending) {
       sendHeartbeat();
       nextHeartbeat = millis() + HEARTBEAT_INTERVAL + (unsigned long)random(HEARTBEAT_JITTER_MS + 1);
     }
