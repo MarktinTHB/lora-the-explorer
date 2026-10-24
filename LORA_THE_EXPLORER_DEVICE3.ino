@@ -1,6 +1,6 @@
-// Current Version: v2.3.2.0
-// Added automatic proximity sleep (10 m group threshold, 30 s entry confirmation, 60 s continuous out-of-range exit) with the single-offline-device exception, and fixed remote compass headings.
-// New proximity state machine pauses on missing/stale GPS instead of waking; sleeping devices wake the radio in GPS-time-aligned 2 s windows every 10 s to exchange SLP code-2 reports; remote headings keep their last valid value with a timestamp (a "360.0" rounding no longer invalidates them) and are drawn as a facing tick on each radar dot; GPS DIST log now includes relative bearing and remote heading.
+// Current Version: v2.3.2.1
+// Fixed compass heading being offset or turning the wrong way after calibration.
+// Calibration now sets the direction faced at its start as 0 degrees and detects from the 20 s clockwise rotation which way the heading must increase (previously only magnet offsets were calibrated, so module mounting rotated/flipped the heading); it counts turns, rejects runs under 1 turn, warns under 2 turns or uneven rotation, and keeps offsets from older saved calibrations.
 
 #include <Arduino.h>
 #include <SPI.h>
@@ -79,7 +79,14 @@ const float MAG_DECLINATION = 0.0f;
 
 // Active compass calibration: X/Y offsets (hard iron) and X/Y scales (soft
 // iron). Replaced by this board's own calibration if one was saved.
-float magCal[4] = {MAG_X_OFFSET, MAG_Y_OFFSET, 1.0f, 1.0f};
+// [4] = raw sensor angle (degrees) of the direction the device faced when
+//       calibration started; that direction becomes 0 degrees.
+// [5] = +1 or -1 so that the heading increases as the device turns clockwise,
+//       whichever way the module is mounted.
+// Defaults (0, +1) reproduce the previous behaviour until a calibration runs.
+#define MAG_CAL_ZERO 4
+#define MAG_CAL_DIR  5
+float magCal[6] = {MAG_X_OFFSET, MAG_Y_OFFSET, 1.0f, 1.0f, 0.0f, 1.0f};
 
 enum MagnetometerType {
   MAG_NONE,
@@ -1054,11 +1061,19 @@ void updateCompass() {
   directionLong = longDirection(heading);
 }
 
-float calculateHeading() {
-  float calibratedX = ((float)magX - magCal[0]) * magCal[2];
-  float calibratedY = ((float)magY - magCal[1]) * magCal[3];
+// Raw angle of a magnetometer sample after hard/soft-iron correction. This is
+// NOT yet a compass heading: its zero and direction depend on how the module
+// is mounted, which calibration measures (magCal[MAG_CAL_ZERO/DIR]).
+float rawMagAngle(float x, float y) {
+  float calibratedX = (x - magCal[0]) * magCal[2];
+  float calibratedY = (y - magCal[1]) * magCal[3];
+  return atan2(calibratedX, calibratedY) * 180.0f / PI;
+}
 
-  float angle = atan2(calibratedX, calibratedY) * 180.0f / PI;
+float calculateHeading() {
+  // 0 = the direction faced at the start of calibration; increases clockwise.
+  float angle = magCal[MAG_CAL_DIR] *
+                (rawMagAngle((float)magX, (float)magY) - magCal[MAG_CAL_ZERO]);
   angle += MAG_DECLINATION;
 
   while (angle < 0.0f) angle += 360.0f;
@@ -3134,35 +3149,67 @@ void runTouchCalibration() {
 // =====================================================
 // COMPASS CALIBRATION
 // On the CHECK LOCATION screen, hold the compass circle for 3 seconds.
-// Keep the device flat and rotate it slowly through 2-3 full circles.
+// The direction the device faces when calibration starts becomes 0 degrees
+// (face it toward true north for correct radar directions). Keep the device
+// flat and rotate it CLOCKWISE through 2-3 full turns for 20 seconds.
 // The result is saved in flash for this board only.
 // =====================================================
 
 #define MAG_CAL_TIME 20000UL
 #define MAG_CAL_MIN_SPAN 200
+// Samples kept for the zero/direction analysis (one per ~50 ms loop).
+#define MAG_CAL_MAX_SAMPLES 480
+// The first samples (~250 ms, before real rotation starts) define 0 degrees.
+#define MAG_CAL_ZERO_SAMPLES 5
+// At least one full turn is needed to measure the direction reliably.
+#define MAG_CAL_MIN_TURNS 1.0f
 
 void loadMagCalibration() {
   Preferences prefs;
   prefs.begin("mag", true);
-  if (prefs.getBytesLength("cal") == sizeof(magCal)) {
+  size_t len = prefs.getBytesLength("cal");
+  if (len == sizeof(magCal)) {
     prefs.getBytes("cal", magCal, sizeof(magCal));
-    Serial.println("Compass calibration: saved (this board)");
+    Serial.printf("Compass calibration: saved (this board) zero=%.1f dir=%+.0f\n",
+                  magCal[MAG_CAL_ZERO], magCal[MAG_CAL_DIR]);
+  } else if (len == 4 * sizeof(float)) {
+    // Calibration saved by an older build: keep its offsets/scales, but it has
+    // no 0-degree reference or direction yet.
+    prefs.getBytes("cal", magCal, 4 * sizeof(float));
+    Serial.println("Compass calibration: old format (offsets only) - recalibrate to set facing");
   } else {
     Serial.println("Compass calibration: default");
   }
   prefs.end();
+  if (magCal[MAG_CAL_DIR] != 1.0f && magCal[MAG_CAL_DIR] != -1.0f) {
+    magCal[MAG_CAL_DIR] = 1.0f;
+  }
+}
+
+// Wrap an angle difference into -180..+180 degrees.
+float wrapAngleDelta(float d) {
+  while (d > 180.0f) d -= 360.0f;
+  while (d < -180.0f) d += 360.0f;
+  return d;
 }
 
 void runMagCalibration() {
   if (!magnetometerPresent) return;
 
-  Serial.println("COMPASS CALIBRATION: rotate the device flat through full circles");
+  Serial.println("COMPASS CALIBRATION: start facing = 0 deg, rotate CLOCKWISE 2-3 turns");
 
   tft.fillScreen(BLACK);
-  drawCenteredText("COMPASS CALIBRATION", 70, WHITE, BLACK, 2);
+  drawCenteredText("COMPASS CALIBRATION", 55, WHITE, BLACK, 2);
+  drawCenteredText("Current facing is now 0 degrees", 90, YELLOW, BLACK, 1);
   drawCenteredText("Keep the device FLAT", 110, YELLOW, BLACK, 1);
-  drawCenteredText("Rotate it slowly in full circles", 125, YELLOW, BLACK, 1);
+  drawCenteredText("Rotate it slowly CLOCKWISE", 125, YELLOW, BLACK, 1);
   drawCenteredText("(2-3 turns) until the timer ends", 140, YELLOW, BLACK, 1);
+
+  // Raw samples are kept so that, once the offsets are known, the start
+  // facing (0 degrees) and the turning direction can be worked out.
+  static int16_t sampleX[MAG_CAL_MAX_SAMPLES];
+  static int16_t sampleY[MAG_CAL_MAX_SAMPLES];
+  int sampleCount = 0;
 
   int16_t minX = 32767, maxX = -32768, minY = 32767, maxY = -32768;
   unsigned long start = millis();
@@ -3175,6 +3222,11 @@ void runMagCalibration() {
       if (magX > maxX) maxX = magX;
       if (magY < minY) minY = magY;
       if (magY > maxY) maxY = magY;
+      if (sampleCount < MAG_CAL_MAX_SAMPLES) {
+        sampleX[sampleCount] = magX;
+        sampleY[sampleCount] = magY;
+        ++sampleCount;
+      }
     }
 
     // Keep this device ONLINE for the others during calibration.
@@ -3211,21 +3263,80 @@ void runMagCalibration() {
     return;
   }
 
+  // Work on a copy so a failed check leaves the old calibration untouched.
+  float previous[6];
+  memcpy(previous, magCal, sizeof(magCal));
+
   float avgSpan = (spanX + spanY) / 2.0f;
   magCal[0] = (maxX + minX) / 2.0f;
   magCal[1] = (maxY + minY) / 2.0f;
   magCal[2] = avgSpan / spanX;
   magCal[3] = avgSpan / spanY;
 
+  // ---- 0-degree reference: average facing of the first samples ----
+  int zeroCount = sampleCount < MAG_CAL_ZERO_SAMPLES ? sampleCount : MAG_CAL_ZERO_SAMPLES;
+  float sumSin = 0.0f, sumCos = 0.0f;
+  for (int i = 0; i < zeroCount; ++i) {
+    float a = rawMagAngle(sampleX[i], sampleY[i]) * PI / 180.0f;
+    sumSin += sinf(a);
+    sumCos += cosf(a);
+  }
+  float zeroAngle = atan2f(sumSin, sumCos) * 180.0f / PI;
+
+  // ---- Direction and number of turns: follow the angle through the run ----
+  float totalTurn = 0.0f;     // signed, degrees
+  int forwardSteps = 0, backwardSteps = 0;
+  float prev = rawMagAngle(sampleX[0], sampleY[0]);
+  for (int i = 1; i < sampleCount; ++i) {
+    float a = rawMagAngle(sampleX[i], sampleY[i]);
+    float d = wrapAngleDelta(a - prev);
+    prev = a;
+    totalTurn += d;
+    if (d > 0.5f) ++forwardSteps;
+    else if (d < -0.5f) ++backwardSteps;
+  }
+  float turns = fabsf(totalTurn) / 360.0f;
+  // The user turns CLOCKWISE, so whichever sign the raw angle moved in is
+  // "increasing heading" for this board.
+  float direction = totalTurn >= 0.0f ? 1.0f : -1.0f;
+  int movingSteps = forwardSteps + backwardSteps;
+  float evenness = movingSteps ? (float)(direction > 0 ? forwardSteps : backwardSteps) / movingSteps : 0.0f;
+
+  Serial.printf("  samples=%d zero_raw=%.1f total_turn=%.1f deg (%.2f turns) dir=%+.0f even=%.0f%%\n",
+                sampleCount, zeroAngle, totalTurn, turns, direction, evenness * 100.0f);
+
+  if (turns < MAG_CAL_MIN_TURNS) {
+    memcpy(magCal, previous, sizeof(magCal));
+    Serial.println("COMPASS CALIBRATION FAILED: less than one full turn, old values kept");
+    drawCenteredText("CALIBRATION FAILED", 130, RED, BLACK, 2);
+    drawCenteredText("Turned " + String(turns, 1) + " times - need 2-3 turns.", 160, WHITE, BLACK, 1);
+    drawCenteredText("Rotate CLOCKWISE in full circles.", 175, WHITE, BLACK, 1);
+    delay(3000);
+    return;
+  }
+
+  magCal[MAG_CAL_ZERO] = zeroAngle;
+  magCal[MAG_CAL_DIR] = direction;
+
   Preferences prefs;
   prefs.begin("mag", false);
   prefs.putBytes("cal", magCal, sizeof(magCal));
   prefs.end();
 
-  Serial.printf("COMPASS CALIBRATION SAVED: offset X=%.1f Y=%.1f  scale X=%.3f Y=%.3f\n",
-                magCal[0], magCal[1], magCal[2], magCal[3]);
-  drawCenteredText("CALIBRATION SAVED", 150, GREEN, BLACK, 2);
-  delay(1500);
+  Serial.printf("COMPASS CALIBRATION SAVED: offset X=%.1f Y=%.1f  scale X=%.3f Y=%.3f  zero=%.1f dir=%+.0f\n",
+                magCal[0], magCal[1], magCal[2], magCal[3],
+                magCal[MAG_CAL_ZERO], magCal[MAG_CAL_DIR]);
+  drawCenteredText("CALIBRATION SAVED", 120, GREEN, BLACK, 2);
+  drawCenteredText("Turns measured: " + String(turns, 1), 150, WHITE, BLACK, 1);
+  // Discrepancy hints: under 2 turns, or many steps in the wrong direction,
+  // means the result may be less accurate.
+  if (turns < 2.0f) {
+    drawCenteredText("Under 2 turns: consider repeating", 165, YELLOW, BLACK, 1);
+  }
+  if (evenness < 0.8f) {
+    drawCenteredText("Uneven rotation: consider repeating", 180, YELLOW, BLACK, 1);
+  }
+  delay(2500);
 }
 
 // =====================================================
