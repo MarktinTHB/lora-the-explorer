@@ -1,6 +1,6 @@
-// Current Version: v2.2.2.1
-// Fixed compass heading being offset or turning the wrong way after calibration.
-// Calibration now sets the direction faced at its start as 0 degrees and detects from the 20 s clockwise rotation which way the heading must increase (previously only magnet offsets were calibrated, so module mounting rotated/flipped the heading); it counts turns, rejects runs under 1 turn, warns under 2 turns or uneven rotation, and keeps offsets from older saved calibrations.
+// Current Version: v2.2.2.2
+// Fixed devices missing packets: peers shown OFFLINE while online and pings reporting "did not reply" although the other device received them.
+// Radio now stays in continuous receive: packets are detected on the DIO0 pin instead of polling LoRa.parsePacket(), which switched the radio to single receive (aborting packets in flight and going deaf ~100 ms later during screen redraws); ping ACKs now refresh the responder's online status; regular heartbeats get 0-300 ms random jitter so two devices cannot stay in step and collide.
 
 #include <Arduino.h>
 #include <SPI.h>
@@ -192,6 +192,12 @@ struct RemoteDevice {
 RemoteDevice remote[4];
 
 #define HEARTBEAT_INTERVAL 3000UL
+// Random 0-300 ms added to each regular heartbeat. With an exact 3000 ms
+// period, two devices that fall into step keep transmitting at the same
+// moment on every cycle: neither hears the other (half-duplex) and the third
+// hears a collision, so both drop to OFFLINE. Worst case 3.3 s keeps three
+// heartbeats inside DEVICE_TIMEOUT.
+#define HEARTBEAT_JITTER_MS 300UL
 // An awake device is considered offline after 10 seconds of no
 // heartbeat/ping communication (about 3 missed heartbeats).
 #define DEVICE_TIMEOUT 10000UL
@@ -1460,11 +1466,52 @@ void acknowledgePing(int requesterId, int targetId, uint16_t sequence,
 // LORA RECEIVE
 // =====================================================
 
+// Packet detection without leaving continuous receive.
+// LoRa.receive() puts the radio in continuous RX with DIO0 mapped to RxDone.
+// Calling LoRa.parsePacket() while no packet is waiting switches the radio to
+// SINGLE RX instead: that restarts reception (losing a packet in flight) and
+// times out after ~100 ms into standby, leaving the radio deaf while the loop
+// is busy redrawing the screen. That caused missed heartbeats (peers shown
+// OFFLINE) and missed ping ACKs ("did not reply"). So parsePacket() is only
+// called once DIO0 reports a complete packet.
+unsigned long lastDio0PacketAt = 0;
+unsigned long lastFallbackPollAt = 0;
+bool dio0WarningShown = false;
+#define LORA_DIO0_FALLBACK_AFTER_MS 15000UL
+#define LORA_FALLBACK_POLL_MS       1000UL
+
+bool loraPacketWaiting() {
+  if (digitalRead(LORA_DIO0) == HIGH) {
+    lastDio0PacketAt = millis();
+    return true;
+  }
+  // Safety net in case DIO0 is not connected on a board: after 15 s without
+  // a DIO0 packet, check the radio directly once per second. With DIO0 wired
+  // and peers transmitting, this never runs.
+  if (millis() - lastDio0PacketAt >= LORA_DIO0_FALLBACK_AFTER_MS &&
+      millis() - lastFallbackPollAt >= LORA_FALLBACK_POLL_MS) {
+    lastFallbackPollAt = millis();
+    return true;
+  }
+  return false;
+}
+
 void receiveLoRa() {
   if (radioSleeping) return;
+  if (!loraPacketWaiting()) return;
 
+  bool viaDio0 = (digitalRead(LORA_DIO0) == HIGH);
   int packetSize = LoRa.parsePacket();
-  if (!packetSize) return;
+  if (!packetSize) {
+    // No packet (fallback poll) or CRC error: return to continuous RX, since
+    // parsePacket() may have switched the radio to single RX.
+    LoRa.receive();
+    return;
+  }
+  if (!viaDio0 && !dio0WarningShown) {
+    dio0WarningShown = true;
+    Serial.println("WARNING: packet found by fallback poll - check the LoRa DIO0 wire (GPIO26)");
+  }
 
   String packet = "";
   while (LoRa.available()) packet += (char)LoRa.read();
@@ -1664,6 +1711,12 @@ void receiveLoRa() {
       int target = packet.substring(second + 1, third).toInt();
       uint16_t sequence = 0;
       bool sequenceValid = parsePingSequence(packet.substring(third + 1), sequence);
+      // Any ACK proves the responder is reachable right now.
+      if (responder >= 1 && responder <= 3 && responder != DEVICE_ID) {
+        remote[responder].lastSeen = millis();
+        remote[responder].online = true;
+        cachedRemoteOnline[responder] = true;
+      }
       if (sequenceValid && pingPending &&
           millis() - pendingPingStartedAt <
             (pendingPingBroadcast ? PING_BROADCAST_WINDOW : PING_REPLY_WINDOW) &&
@@ -2968,6 +3021,8 @@ void setup() {
   pinMode(TFT_CS, OUTPUT);
   pinMode(TOUCH_CS, OUTPUT);
   pinMode(LORA_CS, OUTPUT);
+  // DIO0 signals "packet received" in continuous RX (see loraPacketWaiting()).
+  pinMode(LORA_DIO0, INPUT);
   digitalWrite(TFT_CS, HIGH);
   digitalWrite(TOUCH_CS, HIGH);
   digitalWrite(LORA_CS, HIGH);
@@ -3462,7 +3517,7 @@ void serviceRadio() {
   receiveLoRa();
   if (!sleepMode && !proxSleepActive && (long)(millis() - nextHeartbeat) >= 0) {
     sendHeartbeat();
-    nextHeartbeat = millis() + HEARTBEAT_INTERVAL;
+    nextHeartbeat = millis() + HEARTBEAT_INTERVAL + (unsigned long)random(HEARTBEAT_JITTER_MS + 1);
   }
 }
 
@@ -3687,7 +3742,7 @@ void loop() {
     // In proximity sleep, reports are sent by serviceProximitySleep().
     if ((long)(millis() - nextHeartbeat) >= 0) {
       sendHeartbeat();
-      nextHeartbeat = millis() + HEARTBEAT_INTERVAL;
+      nextHeartbeat = millis() + HEARTBEAT_INTERVAL + (unsigned long)random(HEARTBEAT_JITTER_MS + 1);
     }
   }
 
