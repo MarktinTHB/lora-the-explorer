@@ -1,6 +1,6 @@
-// Current Version: v2.3.3.4
-// Fixed proximity sleep turning on with devices 50-60 m apart and turning on for only two of the three devices.
-// Sleep now needs every pairwise distance strictly below 10 m and every device to agree (each heartbeat carries the device's own together/apart reading; a device joins a peer that is already asleep); it turns on after 5 s continuously together and off after 5 s continuously apart (was 30 s / 60 s), checked every 1 s; distance calibration refuses offsets over 20 m (was 60 m) and drops saved ones that large, which made far devices read as close.
+// Current Version: v2.3.4.0
+// Added a developer screen to turn automatic proximity sleep on/off, and fixed sleeping devices showing OFFLINE on other devices' main menus.
+// Hold the main-menu title 3 s: AUTO SLEEP ON/OFF toggle (saved per device; OFF reports "apart" so the whole group stays awake; main menu shows "AUTO SLEEP OFF (DEVELOPER)"); Sleep Mode now repeats its sleep report twice and sends repeats and 5-min reports in the shared proximity listening window; proximity sleep repeats its entry report after 1 s; a proximity-sleeping device without GPS time reports every 1.8 s instead of 10 s so window-listening peers hear it.
 
 #include <Arduino.h>
 #include <SPI.h>
@@ -284,6 +284,12 @@ unsigned long nextHeartbeat = 0;
 bool sleepMode = false;
 bool radioSleeping = false;
 unsigned long nextSleepLocationReport = 0;
+// Extra sleep reports sent after entering Sleep Mode. A single report that
+// collided left the peers showing this device OFFLINE for 5 minutes.
+#define SLEEP_ANNOUNCE_REPEATS 2
+#define SLEEP_ANNOUNCE_GAP_MS 1500UL
+int sleepAnnounceRepeats = 0;
+uint32_t lastSleepReportCycle = 0xFFFFFFFFUL;
 
 // When THIS device enters Sleep Mode, keep the last known remote statuses
 // frozen on its screen instead of turning them OFFLINE while the radio sleeps.
@@ -331,8 +337,14 @@ bool cachedRemoteAsleep[4] = {false, false, false, false};
 #define PROX_WINDOW_MS             2000UL
 #define PROX_SLOT_BASE_MS          300UL
 #define PROX_SLOT_SPACING_MS       400UL
-// Without GPS time the radio stays on and reports on this local timer.
-#define PROX_UNSYNCED_REPORT_MS    10000UL
+// Without GPS time the radio stays on and reports on this local timer. It
+// is shorter than the 2 s listening window, so sleeping peers (which only
+// listen in that window) still hear at least one report every cycle; at
+// 10 s they mostly missed it and showed this device OFFLINE.
+#define PROX_UNSYNCED_REPORT_MS    1800UL
+// The entry report is repeated once after this delay, so a peer that missed
+// the first one doesn't show this device OFFLINE until the next window.
+#define PROX_ENTRY_REPEAT_MS       1000UL
 
 enum ProximityState {
   PROX_NORMAL_OPERATION,
@@ -352,6 +364,11 @@ enum ProximityReading {
 ProximityState proxState = PROX_NORMAL_OPERATION;
 ProximityState proxStateBeforeUnknown = PROX_NORMAL_OPERATION;
 bool proxSleepActive = false;
+// Developer setting (hold the title on the main menu for 3 s): automatic
+// proximity sleep on/off. Saved in flash. When off, this device stays awake
+// and reports "apart", so the rest of the group stays awake too.
+bool proxSleepEnabled = true;
+unsigned long proxEntryRepeatAt = 0;
 unsigned long proxLastEvalAt = 0;
 // Time accumulated in the current confirmation / out-of-range period.
 unsigned long proxAccumMs = 0;
@@ -555,6 +572,9 @@ float peerDisplayDistance(int deviceId);
 float peerPairDisplayDistance(int idA, int idB);
 String peerRowText(int deviceId);
 void loadDistanceCalibration();
+void loadDeveloperSettings();
+void runDeveloperScreen();
+bool sleepReportSlotReady();
 void saveDistanceCalibration();
 void runDistanceCalibration();
 bool parsePingSequence(const String &text, uint16_t &sequence);
@@ -2297,9 +2317,13 @@ void setSleepMode(bool enabled) {
     remote[DEVICE_ID].online = true;
     remote[DEVICE_ID].asleep = true;
 
-    // Immediately announce sleep mode and save current location.
+    // Immediately announce sleep mode and save current location, then repeat
+    // the report twice (see sleepReportSlotReady()) so a lost report cannot
+    // leave this device shown OFFLINE.
     sendSleepLocationReport();
-    nextSleepLocationReport = millis() + SLEEP_LOCATION_INTERVAL;
+    sleepAnnounceRepeats = SLEEP_ANNOUNCE_REPEATS;
+    lastSleepReportCycle = 0xFFFFFFFFUL;
+    nextSleepLocationReport = millis() + SLEEP_ANNOUNCE_GAP_MS;
     nextHeartbeat = millis() + HEARTBEAT_INTERVAL;
 
     Serial.println("SLEEP MODE ENABLED - REMOTE STATUS FROZEN");
@@ -2526,8 +2550,11 @@ void enterProximitySleep() {
   remote[DEVICE_ID].asleep = true;
   proxLastReportCycle = 0xFFFFFFFFUL;
   proxLastUnsyncedReport = millis();
-  // Announce immediately so awake peers know this silence is intentional.
+  // Announce immediately so awake peers know this silence is intentional,
+  // and once more shortly after in case that report collided.
   sendProximitySleepReport();
+  proxEntryRepeatAt = millis() + PROX_ENTRY_REPEAT_MS;
+  if (proxEntryRepeatAt == 0) proxEntryRepeatAt = 1;
   if (proxOfflineDevice) {
     Serial.printf("PROXIMITY SLEEP ENABLED (LORA #%d offline, left awake for recovery)\n",
                   proxOfflineDevice);
@@ -2538,6 +2565,7 @@ void enterProximitySleep() {
 
 void exitProximitySleep() {
   proxSleepActive = false;
+  proxEntryRepeatAt = 0;
   radioSleeping = false;
   LoRa.idle();
   remote[DEVICE_ID].asleep = false;
@@ -2558,6 +2586,18 @@ void updateProximity() {
   if (sleepMode) {
     proxSleepActive = false;
     if (proxState != PROX_NORMAL_OPERATION) setProxState(PROX_NORMAL_OPERATION, now);
+    return;
+  }
+
+  // Turned off on the developer screen: stay awake and vote "apart".
+  if (!proxSleepEnabled) {
+    if (proxSleepActive) {
+      Serial.println("PROXIMITY SLEEP turned off on the developer screen");
+      exitProximitySleep();
+    }
+    if (proxState != PROX_NORMAL_OPERATION) setProxState(PROX_NORMAL_OPERATION, now);
+    proxOwnGeometryReading = PROX_READING_OUT_OF_RANGE;
+    proxLastReading = PROX_READING_OUT_OF_RANGE;
     return;
   }
 
@@ -2652,6 +2692,21 @@ void updateProximity() {
   }
 }
 
+// A due Sleep Mode report waits for this device's slot in the shared
+// proximity listening window (when GPS time is known), so devices in
+// proximity sleep - which only listen in that window - hear it too. At most
+// one per window; without GPS time it is sent right away.
+bool sleepReportSlotReady() {
+  uint32_t utcMs = 0;
+  if (!gpsUtcMillisOfDay(utcMs)) return true;
+  uint32_t cycle = utcMs / PROX_CYCLE_MS;
+  uint32_t pos = utcMs % PROX_CYCLE_MS;
+  if (pos < proxSlotOffset() || pos >= PROX_WINDOW_MS - 200UL) return false;
+  if (cycle == lastSleepReportCycle) return false;
+  lastSleepReportCycle = cycle;
+  return true;
+}
+
 // Radio duty cycle for proximity sleep, called every loop.
 void serviceProximitySleep() {
   if (sleepMode) return;   // manual sleep manages the radio itself
@@ -2662,6 +2717,16 @@ void serviceProximitySleep() {
   uint32_t pos = utcMs % PROX_CYCLE_MS;
 
   if (proxSleepActive) {
+    if (proxEntryRepeatAt && (long)(millis() - proxEntryRepeatAt) >= 0) {
+      proxEntryRepeatAt = 0;
+      sendProximitySleepReport();   // leaves the radio on; sleeps again below
+    }
+    static bool unsyncedLogged = false;
+    if (!synced != unsyncedLogged) {
+      unsyncedLogged = !synced;
+      Serial.println(synced ? "PROX SLEEP: GPS time OK - using the shared 2 s window"
+                            : "PROX SLEEP: no GPS time - radio stays on, report every 1.8 s");
+    }
     if (!synced) {
       // Without GPS time the devices cannot share a listening window, so the
       // radio stays on (no saving, but no peer is missed) and reports on a
@@ -2859,7 +2924,8 @@ void updateMainMenuDynamic(bool force) {
   }
 
   String sleepText = sleepMode ? "SLEEP MODE IS ENABLED!"
-                   : (proxSleepActive ? "AUTO SLEEP: GROUP IS NEARBY" : "");
+                   : (proxSleepActive ? "AUTO SLEEP: GROUP IS NEARBY"
+                   : (!proxSleepEnabled ? "AUTO SLEEP OFF (DEVELOPER)" : ""));
   if (force || sleepText != lastMainSleepMessage) {
     drawSleepModeArea(sleepText);
     lastMainSleepMessage = sleepText;
@@ -3342,15 +3408,23 @@ void processTouch() {
   static unsigned long lastAcceptedTouch = 0;
   static unsigned long compassHoldStart = 0;
   static unsigned long distanceHoldStart = 0;
+  static unsigned long titleHoldStart = 0;
   bool nowTouched = touch.touched();
 
   if (!nowTouched) {
     wasTouched = false;
     compassHoldStart = 0;
     distanceHoldStart = 0;
+    titleHoldStart = 0;
     return;
   }
   if (wasTouched) {
+    // Holding the title on the main menu for 3 s opens the developer screen.
+    if (titleHoldStart && millis() - titleHoldStart >= 3000UL) {
+      titleHoldStart = 0;
+      runDeveloperScreen();
+      drawMainMenu();
+    }
     // Holding the compass circle for 3 s starts compass calibration.
     if (compassHoldStart && millis() - compassHoldStart >= 3000UL) {
       compassHoldStart = 0;
@@ -3391,6 +3465,12 @@ void processTouch() {
                 p.x, p.y, screenX, screenY);
 
   if (currentScreen == MAIN_MENU) {
+    // Title bar "LORA THE EXPLORER": hold 3 s for the developer screen.
+    if (screenY < 35) {
+      titleHoldStart = millis();
+      return;
+    }
+
     // Double-tap the TIME/DATE area to run the packet test.
     static unsigned long lastTimeTap = 0;
     if (screenX >= 20 && screenX < 220 &&
@@ -3508,6 +3588,7 @@ void setup() {
   loadTouchCalibration();
   loadMagCalibration();
   loadDistanceCalibration();
+  loadDeveloperSettings();
   if (touch.touched()) runTouchCalibration();
 
   // The default 256-byte UART buffer holds only ~0.5 s of NMEA data (the
@@ -4455,6 +4536,91 @@ void runPacketTest() {
   while (touch.touched() && millis() - shownAt < 31000UL) packetTestResultIdle();
 }
 
+// =====================================================
+// DEVELOPER SCREEN
+// Hold the title "LORA THE EXPLORER" on the main menu for 3 s. Turns
+// automatic proximity sleep on/off (saved in flash, per device). While it
+// is off this device reports "apart" in its heartbeats, so no device in the
+// group goes into proximity sleep - handy while testing distances.
+// =====================================================
+
+void loadDeveloperSettings() {
+  Preferences prefs;
+  prefs.begin("dev", true);
+  proxSleepEnabled = prefs.getBool("proxOn", true);
+  prefs.end();
+  Serial.printf("Developer: automatic proximity sleep %s\n", proxSleepEnabled ? "ON" : "OFF");
+}
+
+void saveDeveloperSettings() {
+  Preferences prefs;
+  prefs.begin("dev", false);
+  prefs.putBool("proxOn", proxSleepEnabled);
+  prefs.end();
+}
+
+// One tap on a blocking screen, in screen coordinates (same mapping as
+// processTouch()). Returns false when nothing new was tapped.
+bool readScreenTap(int &screenX, int &screenY) {
+  if (!touch.touched()) return false;
+  digitalWrite(TFT_CS, HIGH);
+  digitalWrite(LORA_CS, HIGH);
+  digitalWrite(TOUCH_CS, LOW);
+  TS_Point p = touch.getPoint();
+  digitalWrite(TOUCH_CS, HIGH);
+  // Wait for release so one tap counts once.
+  unsigned long pressedAt = millis();
+  while (touch.touched() && millis() - pressedAt < 3000UL) { serviceRadio(); delay(5); }
+  if (p.x <= 50 || p.y <= 50 || p.x >= 4045 || p.y >= 4045) return false;
+  float sx = touchCal[0] * (float)p.x + touchCal[1] * (float)p.y + touchCal[2];
+  float sy = touchCal[3] * (float)p.x + touchCal[4] * (float)p.y + touchCal[5];
+  screenX = constrain((int)lroundf(sx), 0, 239);
+  screenY = constrain((int)lroundf(sy), 0, 319);
+  return true;
+}
+
+void drawDeveloperToggle() {
+  tft.fillRect(22, 110, 196, 48, proxSleepEnabled ? GREEN : GRAY);
+  drawCenteredText(proxSleepEnabled ? "AUTO SLEEP: ON" : "AUTO SLEEP: OFF", 127, BLACK,
+                   proxSleepEnabled ? GREEN : GRAY, 2);
+  tft.fillRect(0, 165, SCREEN_W, 30, BLACK);
+  drawCenteredText(proxSleepEnabled ? "Group sleeps when all are < 10 m"
+                                    : "Off: the whole group stays awake",
+                   170, WHITE, BLACK, 1);
+  drawCenteredText("(saved on this device)", 183, GRAY, BLACK, 1);
+}
+
+void runDeveloperScreen() {
+  Serial.println("DEVELOPER SCREEN");
+  tft.fillScreen(BLACK);
+  drawCenteredText("DEVELOPER", 20, YELLOW, BLACK, 2);
+  drawCenteredText("Proximity sleep (10 m)", 85, WHITE, BLACK, 1);
+  drawDeveloperToggle();
+  tft.fillRect(22, 240, 196, 48, WHITE);
+  drawCenteredText("BACK", 257, BLACK, WHITE, 2);
+
+  // Wait for the finger from the 3 s hold to lift first.
+  while (touch.touched()) { serviceRadio(); delay(5); }
+
+  unsigned long lastActivity = millis();
+  while (millis() - lastActivity < 30000UL) {
+    serviceRadio();
+    int x, y;
+    if (readScreenTap(x, y)) {
+      lastActivity = millis();
+      if (x >= 22 && x < 218 && y >= 110 && y < 158) {
+        proxSleepEnabled = !proxSleepEnabled;
+        saveDeveloperSettings();
+        Serial.printf("Developer: automatic proximity sleep %s\n", proxSleepEnabled ? "ON" : "OFF");
+        drawDeveloperToggle();
+      } else if (x >= 22 && x < 218 && y >= 240 && y < 288) {
+        break;
+      }
+    }
+    delay(5);
+  }
+}
+
 // If the display controller lost its setup (power dip, glitch on the SPI
 // lines), re-initialize it and redraw the current screen so it never stays
 // frozen.
@@ -4488,9 +4654,14 @@ void loop() {
   serviceProximitySleep();
 
   if (sleepMode) {
-    if ((long)(millis() - nextSleepLocationReport) >= 0) {
+    if ((long)(millis() - nextSleepLocationReport) >= 0 && sleepReportSlotReady()) {
       sendSleepLocationReport();
-      nextSleepLocationReport = millis() + SLEEP_LOCATION_INTERVAL;
+      if (sleepAnnounceRepeats > 0) {
+        --sleepAnnounceRepeats;
+        nextSleepLocationReport = millis() + SLEEP_ANNOUNCE_GAP_MS;
+      } else {
+        nextSleepLocationReport = millis() + SLEEP_LOCATION_INTERVAL;
+      }
     }
   } else if (!proxSleepActive) {
     // In proximity sleep, reports are sent by serviceProximitySleep().
