@@ -1,6 +1,6 @@
-// Current Version: v2.3.3.3
-// Fixed targeted pings showing "did not reply" although the peer received them, and ping times that included screen-redraw delays.
-// The radio now keeps listening for the reply while a ping is pending (proximity sleep and manual sleep used to switch it off right after sending) and this device's heartbeat waits until the ping is answered; round trips are timed from the DIO0 interrupt instead of when the loop noticed the reply; broadcast shows each device's round trip (slot removed) instead of the 1.2 s window; the receiver's figure is labelled "replied in"; a sleeping target shows "is asleep, no reply".
+// Current Version: v2.3.3.4
+// Fixed proximity sleep turning on with devices 50-60 m apart and turning on for only two of the three devices.
+// Sleep now needs every pairwise distance strictly below 10 m and every device to agree (each heartbeat carries the device's own together/apart reading; a device joins a peer that is already asleep); it turns on after 5 s continuously together and off after 5 s continuously apart (was 30 s / 60 s), checked every 1 s; distance calibration refuses offsets over 20 m (was 60 m) and drops saved ones that large, which made far devices read as close.
 
 #include <Arduino.h>
 #include <SPI.h>
@@ -182,7 +182,7 @@ int gpsSmoothFarFixes = 0;
 #define DIST_CAL_MIN_PEER_SAMPLES   3
 // An offset larger than this means the devices were not together (or a fix
 // was bad), so it is refused instead of applied.
-#define DIST_CAL_MAX_OFFSET_M       60.0f
+#define DIST_CAL_MAX_OFFSET_M       20.0f
 // Noise floor = 2 x the RMS wander measured during calibration, limited to
 // this range (a 30 s sample underestimates slower GPS drift, hence the minimum).
 #define DIST_NOISE_FLOOR_MIN_M      5.0f
@@ -243,6 +243,11 @@ struct RemoteDevice {
   bool proximitySleep = false;
   // Last time a valid compass heading was received from this device.
   unsigned long headingUpdatedAt = 0;
+  // This device's own proximity reading, shared in its heartbeats:
+  // 0 = group apart, 1 = group together (under 10 m), 2 = unknown (no GPS),
+  // -1 = not reported (older firmware). See evaluateGroupProximity().
+  int8_t proxVote = -1;
+  unsigned long proxVoteAt = 0;
 };
 
 RemoteDevice remote[4];
@@ -292,23 +297,25 @@ bool cachedRemoteAsleep[4] = {false, false, false, false};
 // AUTOMATIC PROXIMITY SLEEP
 // =====================================================
 // Rules:
-//  - The group is "together" when every pairwise GPS distance is within
-//    PROX_THRESHOLD_M (all three pairs, or the remaining pair when exactly
-//    one device is confirmed offline - that device is left awake for recovery).
-//  - Enter: together for PROX_ENTRY_CONFIRM_MS of valid checks.
-//  - Exit: apart for PROX_EXIT_OUT_OF_RANGE_MS of continuous valid checks.
-//    Coming back within range resets the exit timer.
+//  - The group is "together" when every pairwise distance (as shown on
+//    screen) is BELOW PROX_THRESHOLD_M - all three pairs, or the remaining
+//    pair when exactly one device is confirmed offline (that device is left
+//    awake for recovery) - AND every other device in the group reports in
+//    its heartbeat that it sees the group together too. Each device measures
+//    with its own GPS and calibration, so without this agreement one device
+//    could read 9 m and sleep while another read 11 m and stayed awake.
+//  - Enter: together continuously for PROX_ENTRY_CONFIRM_MS (5 s).
+//  - Exit: apart continuously for PROX_EXIT_OUT_OF_RANGE_MS (5 s); a device
+//    that wakes reports "apart", so the rest of the group wakes with it.
+//    Any opposite reading restarts the 5 s.
 //  - Missing/stale GPS pauses the decision (PROX_UNKNOWN); it never counts
 //    as being apart and never changes the current sleep state.
 // Note: the thesis text specifies 50 m; this build uses 10 m as requested.
 #define PROX_THRESHOLD_M           10.0f
-#define PROX_ENTRY_CONFIRM_MS      30000UL
-// During the 30 s entry confirmation, brief out-of-range readings (GPS
-// jumps) are not counted but do not restart it; only this much continuous
-// out-of-range time does.
-#define PROX_ENTRY_TOLERANCE_MS    10000UL
-#define PROX_EXIT_OUT_OF_RANGE_MS  60000UL
-#define PROX_EVAL_INTERVAL_MS      2000UL
+#define PROX_ENTRY_CONFIRM_MS      5000UL
+#define PROX_EXIT_OUT_OF_RANGE_MS  5000UL
+// Checked every second (the GPS updates once per second).
+#define PROX_EVAL_INTERVAL_MS      1000UL
 // Peer coordinates older than this are not used for a proximity decision.
 #define PROX_LOCATION_MAX_AGE_MS   25000UL
 // After waking, wait this long (fresh GPS + status) before a new decision.
@@ -350,13 +357,15 @@ unsigned long proxLastEvalAt = 0;
 unsigned long proxAccumMs = 0;
 // proxChainValid is false after an unknown reading, so the gap is not counted.
 bool proxChainValid = false;
-// Start of the current out-of-range run during entry confirmation.
-bool proxEntryOutActive = false;
-unsigned long proxEntryOutSince = 0;
 unsigned long proxChainAt = 0;
 unsigned long proxRecoveryUntil = 0;
 int proxOfflineDevice = 0;
 ProximityReading proxLastReading = PROX_READING_UNKNOWN;
+// This device's own distance reading before the other devices' votes are
+// applied. This is what it reports as its vote: reporting the combined
+// result instead would let two devices that each start from "apart" keep
+// each other apart forever.
+ProximityReading proxOwnGeometryReading = PROX_READING_UNKNOWN;
 unsigned long proxLastLogAt = 0;
 uint32_t proxLastReportCycle = 0xFFFFFFFFUL;
 uint32_t proxLastSlotHeartbeatCycle = 0xFFFFFFFFUL;
@@ -522,6 +531,8 @@ void enterProximitySleep();
 void exitProximitySleep();
 void sendProximitySleepReport();
 ProximityReading evaluateGroupProximity(int &offlineDevice, float distances[3]);
+ProximityReading proxPeerVote(int deviceId);
+int proxOwnVote();
 bool peerConfirmedOffline(int deviceId);
 bool peerLocationFreshForProximity(int deviceId);
 bool anyPeerInProximitySleep();
@@ -1058,6 +1069,17 @@ void loadDistanceCalibration() {
   if (prefs.getBytesLength("cal") == sizeof(distCal)) {
     prefs.getBytes("cal", distCal, sizeof(distCal));
     for (int id = 1; id <= 3; ++id) {
+      // Older builds accepted offsets up to 60 m. An offset that large comes
+      // from a bad GPS fix during calibration and made devices 50-60 m apart
+      // read as close together, so it is dropped (recalibrate that peer).
+      float savedOffset = sqrtf(distCal[id].north * distCal[id].north +
+                                distCal[id].east * distCal[id].east);
+      if (distCal[id].valid && !(savedOffset <= DIST_CAL_MAX_OFFSET_M)) {
+        Serial.printf("Distance calibration LORA #%d: saved offset %.1f m is over %.0f m - ignored, recalibrate\n",
+                      id, savedOffset, DIST_CAL_MAX_OFFSET_M);
+        distCal[id].valid = false;
+        continue;
+      }
       if (distCal[id].valid) {
         Serial.printf("Distance calibration LORA #%d: offset N=%.1f E=%.1f floor=%.1f m (saved)\n",
                       id, distCal[id].north, distCal[id].east, distCal[id].noiseFloor);
@@ -1587,6 +1609,9 @@ void sendHeartbeat() {
   packet += String(magnetometerPresent ? 1 : 0);
   packet += ",";
   packet += magnetometerPresent ? String(heading, 1) : String(-1);
+  // Proximity vote (added at the end; older firmware ignores it).
+  packet += ",";
+  packet += String(proxOwnVote());
 
   // Responsive build: send ONE heartbeat, then immediately return to RX.
   // The longer interval leaves substantially more time for incoming packets.
@@ -1882,11 +1907,11 @@ void receiveLoRa() {
   // HB,id,gpsFix,lat,lon,h,m,s,day,month,year
   // ---------------------------------------------------
   if (packet.startsWith("HB,")) {
-    String f[12];
+    String f[13];
     int startIndex = 3;
     int count = 0;
 
-    while (count < 12) {
+    while (count < 13) {
       int comma = packet.indexOf(',', startIndex);
       if (comma < 0) {
         f[count++] = packet.substring(startIndex);
@@ -1912,6 +1937,11 @@ void receiveLoRa() {
         updateRemoteLocation(sender, f[1].toInt() == 1, f[2].toDouble(),
                  f[3].toDouble(), count >= 12 ? f[10].toInt() : -1,
                  count >= 12 ? f[11].toFloat() : -1.0f);
+
+        // Proximity vote: 0 apart, 1 together, 2 unknown (missing = older firmware).
+        int vote = count >= 13 ? f[12].toInt() : -1;
+        remote[sender].proxVote = (vote >= 0 && vote <= 2) ? (int8_t)vote : (int8_t)-1;
+        remote[sender].proxVoteAt = millis();
 
         int h = f[4].toInt();
         int mi = f[5].toInt();
@@ -1972,6 +2002,10 @@ void receiveLoRa() {
         remote[sender].heartbeatCount = ONLINE_CONFIRM_PACKETS;
         cachedRemoteOnline[sender] = true;
         cachedRemoteAsleep[sender] = sleeping;
+        // A device in proximity sleep sees the group together; one in manual
+        // sleep is not measuring.
+        remote[sender].proxVote = (enabled == 2) ? 1 : 2;
+        remote[sender].proxVoteAt = millis();
         updateRemoteLocation(sender, f[2].toInt() == 1, f[3].toDouble(),
                  f[4].toDouble(), count >= 7 ? f[5].toInt() : -1,
                  count >= 7 ? f[6].toFloat() : -1.0f);
@@ -2034,6 +2068,10 @@ void receiveLoRa() {
         remote[sender].proximitySleep = (sleepCode == 2);
         remote[sender].online = true;
         remote[sender].heartbeatCount = ONLINE_CONFIRM_PACKETS;
+        if (sleepCode == 2) {
+          remote[sender].proxVote = 1;
+          remote[sender].proxVoteAt = millis();
+        }
         updateRemoteLocation(sender, f[3].toInt() == 1, f[4].toDouble(),
                  f[5].toDouble(), count >= 8 ? f[6].toInt() : -1,
                  count >= 8 ? f[7].toFloat() : -1.0f);
@@ -2352,11 +2390,32 @@ bool anyPeerInProximitySleep() {
   return false;
 }
 
+// What a peer last reported seeing. A peer that sees the group apart makes
+// the group apart for everyone; a peer that cannot tell (no GPS) pauses the
+// decision. Older firmware without the vote is taken as agreeing.
+ProximityReading proxPeerVote(int deviceId) {
+  const RemoteDevice &r = remote[deviceId];
+  if (r.proxVote < 0) return PROX_READING_IN_RANGE;
+  if (millis() - r.proxVoteAt > PROX_LOCATION_MAX_AGE_MS) return PROX_READING_UNKNOWN;
+  if (r.proxVote == 1) return PROX_READING_IN_RANGE;
+  if (r.proxVote == 0) return PROX_READING_OUT_OF_RANGE;
+  return PROX_READING_UNKNOWN;
+}
+
+// The vote this device puts in its heartbeat: its own latest reading.
+int proxOwnVote() {
+  if (proxOwnGeometryReading == PROX_READING_IN_RANGE) return 1;
+  if (proxOwnGeometryReading == PROX_READING_OUT_OF_RANGE) return 0;
+  return 2;
+}
+
 // distances[0] = this device <-> peer A, [1] = this device <-> peer B,
 // [2] = peer A <-> peer B (-1 when not computed).
 ProximityReading evaluateGroupProximity(int &offlineDevice, float distances[3]) {
   offlineDevice = 0;
   distances[0] = distances[1] = distances[2] = -1.0f;
+
+  proxOwnGeometryReading = PROX_READING_UNKNOWN;
 
   // No local fix: the decision is paused, never treated as "apart".
   if (!localLocationValid()) return PROX_READING_UNKNOWN;
@@ -2371,8 +2430,11 @@ ProximityReading evaluateGroupProximity(int &offlineDevice, float distances[3]) 
 
   // Both others confirmed offline: there is no group to be "together" with.
   // This never starts proximity sleep and lets a sleeping device recover
-  // through the normal 60 s exit rule.
-  if (offline[0] && offline[1]) return PROX_READING_OUT_OF_RANGE;
+  // through the normal 5 s exit rule.
+  if (offline[0] && offline[1]) {
+    proxOwnGeometryReading = PROX_READING_OUT_OF_RANGE;
+    return PROX_READING_OUT_OF_RANGE;
+  }
 
   // Exactly one device confirmed offline: it is left out of the group (and
   // stays awake for recovery); the other two decide on their own distance.
@@ -2381,8 +2443,12 @@ ProximityReading evaluateGroupProximity(int &offlineDevice, float distances[3]) 
     offlineDevice = peers[offline[0] ? 0 : 1];
     if (!fresh[k]) return PROX_READING_UNKNOWN;
     distances[k] = peerDisplayDistance(peers[k]);
-    return distances[k] <= PROX_THRESHOLD_M ? PROX_READING_IN_RANGE
-                                            : PROX_READING_OUT_OF_RANGE;
+    if (distances[k] >= PROX_THRESHOLD_M) {
+      proxOwnGeometryReading = PROX_READING_OUT_OF_RANGE;
+      return PROX_READING_OUT_OF_RANGE;
+    }
+    proxOwnGeometryReading = PROX_READING_IN_RANGE;
+    return proxPeerVote(peers[k]);
   }
 
   // Normal case: all three pairwise distances must be within the threshold.
@@ -2391,10 +2457,19 @@ ProximityReading evaluateGroupProximity(int &offlineDevice, float distances[3]) 
   distances[0] = peerDisplayDistance(peers[0]);
   distances[1] = peerDisplayDistance(peers[1]);
   distances[2] = peerPairDisplayDistance(peers[0], peers[1]);
-  bool together = distances[0] <= PROX_THRESHOLD_M &&
-                  distances[1] <= PROX_THRESHOLD_M &&
-                  distances[2] <= PROX_THRESHOLD_M;
-  return together ? PROX_READING_IN_RANGE : PROX_READING_OUT_OF_RANGE;
+  bool together = distances[0] < PROX_THRESHOLD_M &&
+                  distances[1] < PROX_THRESHOLD_M &&
+                  distances[2] < PROX_THRESHOLD_M;
+  proxOwnGeometryReading = together ? PROX_READING_IN_RANGE : PROX_READING_OUT_OF_RANGE;
+  if (!together) return PROX_READING_OUT_OF_RANGE;
+  // Together by this device's measurement; the others must agree.
+  ProximityReading a = proxPeerVote(peers[0]);
+  ProximityReading b = proxPeerVote(peers[1]);
+  if (a == PROX_READING_OUT_OF_RANGE || b == PROX_READING_OUT_OF_RANGE) {
+    return PROX_READING_OUT_OF_RANGE;
+  }
+  if (a == PROX_READING_UNKNOWN || b == PROX_READING_UNKNOWN) return PROX_READING_UNKNOWN;
+  return PROX_READING_IN_RANGE;
 }
 
 // Start a new timed period (confirmation or out-of-range) from this moment.
@@ -2407,7 +2482,6 @@ void setProxState(ProximityState next, unsigned long now) {
   proxAccumMs = 0;
   proxChainValid = true;
   proxChainAt = now;
-  proxEntryOutActive = false;
 }
 
 // Add the time since the previous valid reading. After an unknown reading
@@ -2472,7 +2546,7 @@ void exitProximitySleep() {
   sendHeartbeat();
   requestStatusSync();
   nextHeartbeat = millis() + HEARTBEAT_INTERVAL;
-  Serial.println("PROXIMITY SLEEP DISABLED - 60 s CONTINUOUSLY OUT OF RANGE");
+  Serial.println("PROXIMITY SLEEP DISABLED - 5 s CONTINUOUSLY OUT OF RANGE");
 }
 
 void updateProximity() {
@@ -2494,11 +2568,14 @@ void updateProximity() {
 
   if (reading != proxLastReading || now - proxLastLogAt >= 10000UL) {
     proxLastLogAt = now;
-    Serial.printf("PROX CHECK reading=%s state=%s d_a=%.1f d_b=%.1f d_ab=%.1f offline=%d accum_ms=%lu\n",
+    int peerA = DEVICE_ID == 1 ? 2 : 1;
+    int peerB = DEVICE_ID == 3 ? 2 : 3;
+    Serial.printf("PROX CHECK reading=%s state=%s d_a=%.1f d_b=%.1f d_ab=%.1f votes #%d=%d #%d=%d offline=%d accum_ms=%lu\n",
                   reading == PROX_READING_IN_RANGE ? "IN_RANGE"
                     : (reading == PROX_READING_OUT_OF_RANGE ? "OUT_OF_RANGE" : "UNKNOWN"),
-                  proximityStateName(proxState), d[0], d[1], d[2], offlineDevice,
-                  proxAccumMs);
+                  proximityStateName(proxState), d[0], d[1], d[2],
+                  peerA, remote[peerA].proxVote, peerB, remote[peerB].proxVote,
+                  offlineDevice, proxAccumMs);
   }
   proxLastReading = reading;
 
@@ -2512,8 +2589,6 @@ void updateProximity() {
       proxState = PROX_UNKNOWN;
     }
     proxChainValid = false;
-    // Missing GPS is not "out of range": it never restarts the confirmation.
-    proxEntryOutActive = false;
     return;
   }
   if (proxState == PROX_UNKNOWN) {
@@ -2526,25 +2601,23 @@ void updateProximity() {
 
   switch (proxState) {
     case PROX_NORMAL_OPERATION:
-      if (inRange) setProxState(PROX_CONFIRMATION, now);
-      break;
-
     case PROX_CONFIRMATION:
+      // Must stay together for 5 s in a row; one apart reading cancels it.
       if (!inRange) {
-        // Out-of-range time is not counted toward the 30 s, but only a
-        // continuous out-of-range run of PROX_ENTRY_TOLERANCE_MS restarts it.
-        if (!proxEntryOutActive) {
-          proxEntryOutActive = true;
-          proxEntryOutSince = now;
-        } else if (now - proxEntryOutSince >= PROX_ENTRY_TOLERANCE_MS) {
-          setProxState(PROX_NORMAL_OPERATION, now);
-          break;
-        }
-        proxChainValid = false;
+        if (proxState != PROX_NORMAL_OPERATION) setProxState(PROX_NORMAL_OPERATION, now);
         break;
       }
-      proxEntryOutActive = false;
-      proxAccumulate(now);
+      if (proxState == PROX_NORMAL_OPERATION) {
+        setProxState(PROX_CONFIRMATION, now);
+        // A peer already asleep has confirmed the 5 s for the group (it
+        // needed this device's "together" vote to do so); join it now
+        // instead of starting a new 5 s, so the group sleeps as one.
+        if (!anyPeerInProximitySleep()) break;
+        proxAccumMs = PROX_ENTRY_CONFIRM_MS;
+      } else {
+        proxAccumulate(now);
+        if (anyPeerInProximitySleep()) proxAccumMs = PROX_ENTRY_CONFIRM_MS;
+      }
       if (proxAccumMs >= PROX_ENTRY_CONFIRM_MS) {
         enterProximitySleep();
         setProxState(PROX_SLEEP, now);
@@ -2552,13 +2625,13 @@ void updateProximity() {
       break;
 
     case PROX_SLEEP:
-      // First valid out-of-range reading starts the 60 s continuous timer.
+      // First valid out-of-range reading starts the 5 s continuous timer.
       if (!inRange) setProxState(PROX_OUT_OF_RANGE_MONITORING, now);
       break;
 
     case PROX_OUT_OF_RANGE_MONITORING:
       if (inRange) {
-        // Back together before 60 s: cancel the timer, stay asleep.
+        // Back together before 5 s: cancel the timer, stay asleep.
         setProxState(PROX_SLEEP, now);
         break;
       }
