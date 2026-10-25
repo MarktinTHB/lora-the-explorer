@@ -1,6 +1,6 @@
-// Current Version: v2.3.4.0
-// Added a developer screen to turn automatic proximity sleep on/off, and fixed sleeping devices showing OFFLINE on other devices' main menus.
-// Hold the main-menu title 3 s: AUTO SLEEP ON/OFF toggle (saved per device; OFF reports "apart" so the whole group stays awake; main menu shows "AUTO SLEEP OFF (DEVELOPER)"); Sleep Mode now repeats its sleep report twice and sends repeats and 5-min reports in the shared proximity listening window; proximity sleep repeats its entry report after 1 s; a proximity-sleeping device without GPS time reports every 1.8 s instead of 10 s so window-listening peers hear it.
+// Current Version: v2.3.4.1
+// Fixed packet test losses caused by the devices themselves: late replies running into the next test packet, screen redraws delaying replies, and an uneven send rhythm.
+// Replies are now timed from when the test packet arrived (DIO0 interrupt) and skipped if they could not finish before the next one (the next reply still carries the received count); devices answering a test pause screen redraws and touch until it ends, then redraw; the tester sends on a fixed 300 ms schedule with the counter drawn right after each send; reply round trips use the interrupt time.
 
 #include <Arduino.h>
 #include <SPI.h>
@@ -519,7 +519,7 @@ void updatePing();
 void acknowledgePing(int requesterId, int targetId, uint16_t sequence,
                      unsigned long receivedAt);
 void receiveLoRa();
-void handlePacketTest(const String &packet);
+void handlePacketTest(const String &packet, unsigned long receivedAt);
 void runPacketTest();
 void updateDeviceStatus();
 
@@ -1917,7 +1917,7 @@ void receiveLoRa() {
 
   // PACKET TEST: T,<sender>,<seq> and replies TR,<responder>,<to>,<seq>,<rssi>,<snr>
   if (packet.startsWith("T,") || packet.startsWith("TR,")) {
-    handlePacketTest(packet);
+    handlePacketTest(packet, packetReceivedAt);
     LoRa.receive();
     return;
   }
@@ -4031,7 +4031,9 @@ void sendRawLoRa(const String &packet) {
   LoRa.receive();
 }
 
-void handlePacketTest(const String &packet) {
+// receivedAt = when the radio finished receiving this packet (DIO0
+// interrupt time, see receiveLoRa()), not when the loop got to it.
+void handlePacketTest(const String &packet, unsigned long receivedAt) {
   int rssi = LoRa.packetRssi();
   float snr = LoRa.packetSnr();
 
@@ -4070,10 +4072,29 @@ void handlePacketTest(const String &packet) {
     remote[sender].online = true;
     cachedRemoteOnline[sender] = true;
 
-    delay(packetTestReplyDelay(DEVICE_ID));
-    sendRawLoRa("TR," + String(DEVICE_ID) + "," + String(sender) + "," +
-                String(seq) + "," + String(rssi) + "," + String(snr, 1) + "," +
-                String(peerTestRxCount));
+    // Reply in this device's slot, counted from when the test packet
+    // ARRIVED. Counting from when the loop read it (after a screen redraw,
+    // say) made late replies run into the next test packet, which this
+    // radio then could not hear. A reply that can no longer finish before
+    // the next test packet is skipped: the following reply still reports
+    // the received count, so the delivery result is unaffected.
+    String reply = "TR," + String(DEVICE_ID) + "," + String(sender) + "," +
+                   String(seq) + "," + String(rssi) + "," + String(snr, 1) + "," +
+                   String(peerTestRxCount);
+    unsigned long replyAt = receivedAt + packetTestReplyDelay(DEVICE_ID);
+    // Next test packet starts TEST_PACKET_INTERVAL after this one started,
+    // i.e. (interval - this packet's airtime) after it arrived.
+    unsigned long nextPacketAt = receivedAt + TEST_PACKET_INTERVAL -
+      (unsigned long)estimateLoRaToAMs((uint8_t)packet.length());
+    unsigned long replyAirtime = (unsigned long)estimateLoRaToAMs((uint8_t)reply.length()) + 10UL;
+    unsigned long now = millis();
+    if ((long)(now - replyAt) < 0) {
+      delay(replyAt - now);
+    } else if ((long)(now + replyAirtime - nextPacketAt) > 0) {
+      Serial.printf("TEST REPLY SKIPPED seq=%d (%lu ms late)\n", seq, now - replyAt);
+      return;
+    }
+    sendRawLoRa(reply);
     return;
   }
 
@@ -4120,8 +4141,8 @@ void handlePacketTest(const String &packet) {
   if (s.received) return;   // duplicate
 
   // A late reply (arriving after the next packet was sent) still counts,
-  // timed against its own packet.
-  unsigned long rtt = millis() - packetTestSentAt[seq];
+  // timed against its own packet, up to when the radio received the reply.
+  unsigned long rtt = receivedAt - packetTestSentAt[seq];
   unsigned long slot = packetTestReplyDelay(responder);
   rtt = rtt > slot ? rtt - slot : 0;
 
@@ -4407,18 +4428,28 @@ void runPacketTest() {
   Serial.printf("PACKET TEST START device=%d test=%d\n", DEVICE_ID, packetTestId);
   packetTestRunning = true;
 
+  // Packets go out on a fixed 300 ms schedule. The counter is redrawn right
+  // after each packet is sent (replies wait in the radio meanwhile), so the
+  // ~40 ms redraw no longer stretches the gap between packets.
+  unsigned long testStart = millis();
   for (int seq = 0; seq < TEST_PACKET_COUNT; seq++) {
-    packetTestSentAt[seq] = millis();
-    sendRawLoRa("T," + String(DEVICE_ID) + "," + String(seq));
-
-    while (millis() - packetTestSentAt[seq] < TEST_PACKET_INTERVAL) {
+    unsigned long dueAt = testStart + (unsigned long)seq * TEST_PACKET_INTERVAL;
+    while ((long)(millis() - dueAt) < 0) {
       receiveLoRa();
       updateGPS();
       delay(1);
     }
+    packetTestSentAt[seq] = millis();
+    sendRawLoRa("T," + String(DEVICE_ID) + "," + String(seq));
 
     tft.fillRect(0, 80, SCREEN_W, 40, BLACK);
     drawCenteredText(String(seq + 1) + " / " + String(TEST_PACKET_COUNT), 85, GREEN, BLACK, 2);
+  }
+  // Let the last packet's reply slots pass before the grace period.
+  while ((long)(millis() - (testStart + (unsigned long)TEST_PACKET_COUNT * TEST_PACKET_INTERVAL)) < 0) {
+    receiveLoRa();
+    updateGPS();
+    delay(1);
   }
 
   // Short grace period for the last replies.
@@ -4649,7 +4680,9 @@ void loop() {
   receiveLoRa();
   updatePing();
   updateDeviceStatus();
-  processTouch();
+  // Touch is ignored while another device's packet test runs here (a tap
+  // could open a blocking screen or send a ping over the test).
+  if ((long)(peerTestActiveUntil - millis()) <= 0) processTouch();
   updateProximity();
   serviceProximitySleep();
 
@@ -4673,7 +4706,23 @@ void loop() {
     }
   }
 
+  // While another device's packet test is running here, the screen is not
+  // redrawn: a redraw keeps the loop from reading test packets and sending
+  // replies on time. Everything is redrawn once the test is over.
+  static bool screenPausedForTest = false;
+  if ((long)(peerTestActiveUntil - millis()) > 0) {
+    if (!screenPausedForTest) Serial.println("PACKET TEST from another device: screen paused");
+    screenPausedForTest = true;
+    delay(1);
+    return;
+  }
   bool forceRefresh = false;
+  if (screenPausedForTest) {
+    screenPausedForTest = false;
+    forceRefresh = true;
+    lastScreenRefresh = millis();
+    Serial.println("PACKET TEST over: screen resumed");
+  }
   if (millis() - lastScreenRefresh >= SCREEN_REFRESH_INTERVAL) {
     lastScreenRefresh = millis();
     forceRefresh = true;
