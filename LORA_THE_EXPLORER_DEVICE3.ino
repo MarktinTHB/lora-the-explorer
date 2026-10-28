@@ -1,6 +1,6 @@
-// Current Version: v2.3.4.1
-// Fixed packet test losses caused by the devices themselves: late replies running into the next test packet, screen redraws delaying replies, and an uneven send rhythm.
-// Replies are now timed from when the test packet arrived (DIO0 interrupt) and skipped if they could not finish before the next one (the next reply still carries the received count); devices answering a test pause screen redraws and touch until it ends, then redraw; the tester sends on a fixed 300 ms schedule with the counter drawn right after each send; reply round trips use the interrupt time.
+// Current Version: v2.3.5.1
+// Fixed devices showing OFFLINE during and right after a packet test and flickering OFFLINE at long range, and packet tests reading 0/20 when only the replies were lost.
+// No device is timed out while a packet test runs (heartbeats are held then) or for 10 s after; awake devices go OFFLINE after 26 s (5 heartbeats) instead of 16 s; the device answering a test now shows its own count ("Test from LORA #1: got 17/20") for 60 s, and the tester says when no reply came back; the radio's settings are checked every 10 s and restored if a supply dip reset the chip.
 
 #include <Arduino.h>
 #include <SPI.h>
@@ -48,6 +48,17 @@ XPT2046_Touchscreen touch(TOUCH_CS);
 #define LORA_RST   32
 #define LORA_DIO0  26
 #define LORA_FREQ  915E6
+// Radio settings, shared by all three devices (a device with different
+// settings cannot hear the others at all).
+// v2.x.5.0 range extension: SF7 -> SF10 (+9 dB receiver sensitivity,
+// datasheet -123 -> -132 dBm) and 17 -> 20 dBm (+3 dB, RFM95W maximum).
+// SF10 is the highest spreading factor at which a heartbeat (~0.66 s on
+// air) still arrives within the thesis latency limit of 1000 ms; SF11/SF12
+// would exceed it. Packets take ~6x longer on air, so the timings below
+// (heartbeat slots, sleep window, ping and packet test slots) are scaled.
+#define LORA_SF        10
+#define LORA_BW_HZ     125E3
+#define LORA_TX_DBM    20
 
 // =====================================================
 // NEO-6M GPS
@@ -252,16 +263,29 @@ struct RemoteDevice {
 
 RemoteDevice remote[4];
 
-#define HEARTBEAT_INTERVAL 3000UL
-// Random 0-300 ms added to each regular heartbeat. With an exact 3000 ms
-// period, two devices that fall into step keep transmitting at the same
-// moment on every cycle: neither hears the other (half-duplex) and the third
-// hears a collision, so both drop to OFFLINE. Worst case 3.3 s keeps three
-// heartbeats inside DEVICE_TIMEOUT.
-#define HEARTBEAT_JITTER_MS 300UL
-// An awake device is considered offline after 10 seconds of no
-// heartbeat/ping communication (about 3 missed heartbeats).
-#define DEVICE_TIMEOUT 10000UL
+// Heartbeats: every 5 s. With GPS time each device sends in its own slot of
+// a shared 5 s cycle (ID 1 at 0.2 s, ID 2 at 1.0 s, ID 3 at 1.8 s - see
+// heartbeatDue()), so at SF10 (~0.66 s per heartbeat) they never collide;
+// the same slots fall inside the proximity-sleep listening window. Without
+// GPS time it falls back to a timer.
+#define HEARTBEAT_INTERVAL 5000UL
+#define HEARTBEAT_CYCLE_MS 5000UL
+// A slot that the loop reaches later than this is skipped (it would run
+// into the next device's slot); the next cycle is 5 s later.
+#define HEARTBEAT_SLOT_LATE_MS 100UL
+// Random 0-1000 ms added to each timer heartbeat (no GPS time). With an
+// exact period, two devices that fall into step keep transmitting at the
+// same moment on every cycle: neither hears the other (half-duplex) and the
+// third hears a collision, so both drop to OFFLINE.
+#define HEARTBEAT_JITTER_MS 1000UL
+// An awake device is considered offline after 26 seconds of no
+// heartbeat/ping communication (5 missed heartbeats). Near the edge of range
+// a few heartbeats in a row can be lost; 3 (16 s) made devices flicker
+// OFFLINE there.
+#define DEVICE_TIMEOUT 26000UL
+// While a packet test runs, heartbeats are held on purpose, so no device is
+// timed out until this time (the test plus two heartbeat cycles after it).
+unsigned long statusTimeoutHoldUntil = 0;
 // Sleeping devices report every 5 minutes. Allow two missed reports before
 // considering the sleeping device truly offline.
 #define SLEEP_LOCATION_INTERVAL 300000UL
@@ -334,14 +358,17 @@ bool cachedRemoteAsleep[4] = {false, false, false, false};
 // GPS UTC time so all devices listen at the same moment. Each device sends
 // its report in its own slot inside that window.
 #define PROX_CYCLE_MS              10000UL
-#define PROX_WINDOW_MS             2000UL
-#define PROX_SLOT_BASE_MS          300UL
-#define PROX_SLOT_SPACING_MS       400UL
+// (v2.x.5.0: window 2 s -> 3 s and slots 0.4 s -> 0.8 s apart, because a
+// report takes ~0.5 s and a heartbeat ~0.66 s on air at SF10.)
+#define PROX_WINDOW_MS             3000UL
+#define PROX_SLOT_BASE_MS          200UL
+#define PROX_SLOT_SPACING_MS       800UL
 // Without GPS time the radio stays on and reports on this local timer. It
 // is shorter than the 2 s listening window, so sleeping peers (which only
 // listen in that window) still hear at least one report every cycle; at
-// 10 s they mostly missed it and showed this device OFFLINE.
-#define PROX_UNSYNCED_REPORT_MS    1800UL
+// 10 s they mostly missed it and showed this device OFFLINE. (2.4 s = the
+// 3 s window minus one ~0.5 s report at SF10.)
+#define PROX_UNSYNCED_REPORT_MS    2400UL
 // The entry report is repeated once after this delay, so a peer that missed
 // the first one doesn't show this device OFFLINE until the next window.
 #define PROX_ENTRY_REPEAT_MS       1000UL
@@ -400,14 +427,20 @@ unsigned long pingMessageTime = 0;
 #define PING_REPLY_WINDOW 3000UL
 // Broadcast replies arrive in per-device slots (ID x 250 ms); this window
 // collects all of them before "You pinged everyone" is shown.
-#define PING_BROADCAST_WINDOW 1200UL
-#define PING_BROADCAST_SLOT 250UL
+// (SF10: an ACK takes ~0.29 s on air, so slots are 400 ms apart.)
+#define PING_BROADCAST_WINDOW 2200UL
+#define PING_BROADCAST_SLOT 400UL
 uint16_t pingSequence = 0;
 bool pingPending = false;
 int pendingPingTarget = 0;
 bool pendingPingBroadcast = false;
 uint16_t pendingPingSequence = 0;
 unsigned long pendingPingStartedAt = 0;
+// Shown on the main menu of a device that answered a packet test: how many
+// of the tester's packets it received (the one-way count, measured here).
+String peerTestResultMessage = "";
+unsigned long peerTestResultAt = 0;
+#define PEER_TEST_RESULT_SHOW_MS 60000UL
 bool broadcastAckSeen[4] = {false, false, false, false};
 uint8_t broadcastAckCount = 0;
 // Round trip per broadcast responder, with its reply slot taken out.
@@ -428,15 +461,16 @@ unsigned long lastDistanceLog[4] = {0, 0, 0, 0};
 
 // Optional LoRa airtime diagnostic; this is not measured ping latency.
 float estimateLoRaToAMs(uint8_t payloadBytes) {
-  const float bandwidth = 125000.0f;
-  const int sf = 7;
+  const float bandwidth = (float)LORA_BW_HZ;
+  const int sf = LORA_SF;
   const int cr = 1;       // 4/5
   const int ih = 0;       // explicit header
-  const int de = 0;       // SF7
   const int crc = 1;
   const int preamble = 8;
 
   const float symbolTimeMs = ((float)(1UL << sf) / bandwidth) * 1000.0f;
+  // Low data rate optimisation is on when a symbol lasts 16 ms or more.
+  const int de = symbolTimeMs >= 16.0f ? 1 : 0;
   const int numerator = 8 * (int)payloadBytes - 4 * sf + 28 + 16 * crc - 20 * ih;
   const int denominator = 4 * (sf - 2 * de);
 
@@ -510,6 +544,10 @@ float calculateHeading();
 void updateDirectionStrings();
 
 void sendHeartbeat();
+void configureLoRaRadio();
+void checkRadioHealth();
+bool heartbeatDue();
+void heartbeatSent();
 void requestStatusSync();
 void sendStateResponse(int targetId);
 void sendSleepLocationReport();
@@ -930,7 +968,7 @@ bool localLocationValid() {
 // Awake peers send every 3 s, proximity-sleeping peers every 10 s, and
 // manually sleeping peers every 5 minutes.
 unsigned long remoteDataMaxAge(int deviceId) {
-  if (!remote[deviceId].asleep) return 15000UL;
+  if (!remote[deviceId].asleep) return 16000UL;
   return remote[deviceId].proximitySleep ? 30000UL : 360000UL;
 }
 
@@ -2249,10 +2287,12 @@ void updateDeviceStatus() {
     unsigned long timeout = remote[i].asleep
       ? (remote[i].proximitySleep ? PROX_PEER_TIMEOUT : SLEEP_DEVICE_TIMEOUT)
       : DEVICE_TIMEOUT;
-    // While THIS device is in proximity sleep it only listens 2 s out of
+    // While THIS device is in proximity sleep it only listens 3 s out of
     // every 10 s, so awake peers are heard less often. Do not mistake that
     // for them going offline.
     if (proxSleepActive && timeout < PROX_PEER_TIMEOUT) timeout = PROX_PEER_TIMEOUT;
+    // Heartbeats are held during a packet test: keep every status as it is.
+    if ((long)(statusTimeoutHoldUntil - now) > 0) continue;
 
     if (now - remote[i].lastSeen > timeout) {
       remote[i].online = false;
@@ -2390,6 +2430,30 @@ bool gpsUtcMillisOfDay(uint32_t &msOfDay) {
 
 uint32_t proxSlotOffset() {
   return PROX_SLOT_BASE_MS + (uint32_t)(DEVICE_ID - 1) * PROX_SLOT_SPACING_MS;
+}
+
+// Is a regular heartbeat due now? nextHeartbeat is a "not before" time
+// (holds during pings, packet tests and after waking still apply). With GPS
+// time: once per 5 s cycle, in this device's slot. Without: on the timer.
+uint32_t lastHeartbeatCycle = 0xFFFFFFFFUL;
+bool heartbeatDue() {
+  if ((long)(millis() - nextHeartbeat) < 0) return false;
+  uint32_t utcMs = 0;
+  if (!gpsUtcMillisOfDay(utcMs)) return true;
+  uint32_t cycle = utcMs / HEARTBEAT_CYCLE_MS;
+  uint32_t pos = utcMs % HEARTBEAT_CYCLE_MS;
+  if (cycle == lastHeartbeatCycle) return false;
+  return pos >= proxSlotOffset() && pos < proxSlotOffset() + HEARTBEAT_SLOT_LATE_MS;
+}
+
+void heartbeatSent() {
+  uint32_t utcMs = 0;
+  if (gpsUtcMillisOfDay(utcMs)) {
+    lastHeartbeatCycle = utcMs / HEARTBEAT_CYCLE_MS;
+    nextHeartbeat = millis() + 1000UL;
+  } else {
+    nextHeartbeat = millis() + HEARTBEAT_INTERVAL + (unsigned long)random(HEARTBEAT_JITTER_MS + 1);
+  }
 }
 
 // Offline means silent for a long time - never just asleep. A peer in either
@@ -2701,7 +2765,7 @@ bool sleepReportSlotReady() {
   if (!gpsUtcMillisOfDay(utcMs)) return true;
   uint32_t cycle = utcMs / PROX_CYCLE_MS;
   uint32_t pos = utcMs % PROX_CYCLE_MS;
-  if (pos < proxSlotOffset() || pos >= PROX_WINDOW_MS - 200UL) return false;
+  if (pos < proxSlotOffset() || pos >= proxSlotOffset() + HEARTBEAT_SLOT_LATE_MS) return false;
   if (cycle == lastSleepReportCycle) return false;
   lastSleepReportCycle = cycle;
   return true;
@@ -2764,15 +2828,10 @@ void serviceProximitySleep() {
     return;
   }
 
-  // Awake device with a peer in proximity sleep: put one heartbeat inside
-  // the shared window (in this device's slot) so the sleeping peer receives
-  // this device's position every cycle.
-  if (synced && anyPeerInProximitySleep() &&
-      pos >= proxSlotOffset() && pos < PROX_WINDOW_MS &&
-      cycle != proxLastSlotHeartbeatCycle) {
-    proxLastSlotHeartbeatCycle = cycle;
-    sendHeartbeat();
-  }
+  // An awake device's regular heartbeats are sent in its slot of the 5 s
+  // cycle (heartbeatDue()), which falls inside every 10 s listening window,
+  // so sleeping peers hear it without an extra heartbeat here (an extra one
+  // in the same slot would now run into the next device's slot).
 }
 
 
@@ -2916,6 +2975,9 @@ void updateMainMenuDynamic(bool force) {
   String showPing = "";
   if (pingMessage.length() && millis() - pingMessageTime < PING_MESSAGE_TIME) {
     showPing = pingMessage;
+  } else if (peerTestResultMessage.length() &&
+             millis() - peerTestResultAt < PEER_TEST_RESULT_SHOW_MS) {
+    showPing = peerTestResultMessage;
   }
 
   if (force || showPing != lastMainPing) {
@@ -3610,10 +3672,7 @@ void setup() {
   // Timestamp only (see onLoRaDio0Rise); reception itself is still polled.
   attachInterrupt(digitalPinToInterrupt(LORA_DIO0), onLoRaDio0Rise, RISING);
 
-  LoRa.setTxPower(17);
-  LoRa.setSpreadingFactor(7);
-  LoRa.setSignalBandwidth(125E3);
-  LoRa.setCodingRate4(5);
+  configureLoRaRadio();
 
   // Start in continuous receive mode immediately. This prevents a device
   // that boots later from missing the other device's first heartbeat or ping.
@@ -3870,9 +3929,10 @@ void runMagCalibration() {
     receiveLoRa();
     // Keep reading the GPS so its data is not lost during the 20 s.
     updateGPS();
-    if (millis() - lastBeat >= HEARTBEAT_INTERVAL) {
+    if (heartbeatDue()) {
       lastBeat = millis();
       sendHeartbeat();
+      heartbeatSent();
     }
 
     if (millis() - lastDraw >= 500UL) {
@@ -3988,8 +4048,12 @@ void runMagCalibration() {
 // =====================================================
 
 #define TEST_PACKET_COUNT 20
-#define TEST_PACKET_INTERVAL 300UL
-#define TEST_REPLY_SLOT 70UL
+// SF10: a test packet takes ~0.25 s and a reply ~0.37 s on air. The two
+// responders reply one after the other (slots by rank, not ID), then the
+// next test packet follows: 0.25 + 0.01 + 2 x 0.42 s + margin = 1.15 s.
+// 20 packets take ~23 s.
+#define TEST_PACKET_INTERVAL 1150UL
+#define TEST_REPLY_SLOT 420UL
 
 // One entry per test packet per peer.
 struct PacketSample {
@@ -4017,8 +4081,11 @@ PacketSample packetSamples[4][TEST_PACKET_COUNT];
 int packetTestDelivered[4];
 
 // Each device answers in its own slot so replies from #2 and #3 don't collide.
-unsigned long packetTestReplyDelay(int id) {
-  return 10UL + (unsigned long)(id - 1) * TEST_REPLY_SLOT;
+// The two responders take slots 1 and 2 in ID order (the tester's own ID
+// is skipped), so no slot is wasted.
+unsigned long packetTestReplyDelay(int id, int testerId) {
+  int rank = (testerId >= 1 && testerId < id) ? id - 1 : id;   // 1 or 2
+  return 10UL + (unsigned long)(rank - 1) * TEST_REPLY_SLOT;
 }
 
 void sendRawLoRa(const String &packet) {
@@ -4054,8 +4121,9 @@ void handlePacketTest(const String &packet, unsigned long receivedAt) {
     ++peerTestRxCount;
     peerTestLastSeq = seq;
 
-    peerTestActiveUntil = millis() + 2000UL;
+    peerTestActiveUntil = millis() + 2UL * TEST_PACKET_INTERVAL + 500UL;
     peerTestDevice = sender;
+    statusTimeoutHoldUntil = peerTestActiveUntil + 2UL * HEARTBEAT_INTERVAL;
 
     // Hold this device's heartbeat until the test is over. While a heartbeat
     // is on air this radio cannot hear the next test packet, and it collides
@@ -4081,7 +4149,7 @@ void handlePacketTest(const String &packet, unsigned long receivedAt) {
     String reply = "TR," + String(DEVICE_ID) + "," + String(sender) + "," +
                    String(seq) + "," + String(rssi) + "," + String(snr, 1) + "," +
                    String(peerTestRxCount);
-    unsigned long replyAt = receivedAt + packetTestReplyDelay(DEVICE_ID);
+    unsigned long replyAt = receivedAt + packetTestReplyDelay(DEVICE_ID, sender);
     // Next test packet starts TEST_PACKET_INTERVAL after this one started,
     // i.e. (interval - this packet's airtime) after it arrived.
     unsigned long nextPacketAt = receivedAt + TEST_PACKET_INTERVAL -
@@ -4143,7 +4211,7 @@ void handlePacketTest(const String &packet, unsigned long receivedAt) {
   // A late reply (arriving after the next packet was sent) still counts,
   // timed against its own packet, up to when the radio received the reply.
   unsigned long rtt = receivedAt - packetTestSentAt[seq];
-  unsigned long slot = packetTestReplyDelay(responder);
+  unsigned long slot = packetTestReplyDelay(responder, DEVICE_ID);
   rtt = rtt > slot ? rtt - slot : 0;
 
   s.received = true;
@@ -4159,9 +4227,9 @@ void handlePacketTest(const String &packet, unsigned long receivedAt) {
 void serviceRadio() {
   receiveLoRa();
   updateGPS();
-  if (!sleepMode && !proxSleepActive && (long)(millis() - nextHeartbeat) >= 0) {
+  if (!sleepMode && !proxSleepActive && heartbeatDue()) {
     sendHeartbeat();
-    nextHeartbeat = millis() + HEARTBEAT_INTERVAL + (unsigned long)random(HEARTBEAT_JITTER_MS + 1);
+    heartbeatSent();
   }
 }
 
@@ -4462,6 +4530,9 @@ void runPacketTest() {
 
   packetTestRunning = false;
   nextHeartbeat = millis() + HEARTBEAT_INTERVAL;
+  // The peers held their heartbeats during the test (and this device's loop
+  // was not running): give them two cycles to be heard before any timeout.
+  statusTimeoutHoldUntil = millis() + 2UL * HEARTBEAT_INTERVAL;
 
   printPacketTestCsv();
 
@@ -4542,7 +4613,10 @@ void runPacketTest() {
              String(snrHereSum / received, 1) + "," + String(rssiThereSum / received) + "," +
              String(snrThereSum / received, 1) + ",";
     } else {
-      drawCenteredText("No reply (OFF, asleep, or out of range)", y + 25, GRAY, BLACK, 1);
+      // No reply came back, so this device cannot know how many of its
+      // packets arrived; the peer counts them itself and shows the result.
+      drawCenteredText("No replies came back to this device", y + 25, GRAY, BLACK, 1);
+      drawCenteredText("Packets received: see LORA #" + String(id) + "'s screen", y + 40, YELLOW, BLACK, 1);
       sum += ",,,,,";
     }
     drawCenteredText(distText, y + 70, distance < 0 ? GRAY : LOCATION_GREEN, BLACK, 1);
@@ -4555,7 +4629,7 @@ void runPacketTest() {
   }
 
   if (anyReply) {
-    drawCenteredText("RSSI: -30 great ... -120 very weak", 255, GRAY, BLACK, 1);
+    drawCenteredText("RSSI: -30 great ... -130 at the limit", 255, GRAY, BLACK, 1);
   }
   drawCenteredText("Tap anywhere to go back", 295, YELLOW, BLACK, 1);
   Serial.println("PACKET TEST END");
@@ -4652,6 +4726,57 @@ void runDeveloperScreen() {
   }
 }
 
+// =====================================================
+// LORA RADIO SETTINGS AND HEALTH CHECK
+// =====================================================
+
+void configureLoRaRadio() {
+  LoRa.setTxPower(LORA_TX_DBM);
+  LoRa.setSpreadingFactor(LORA_SF);
+  LoRa.setSignalBandwidth(LORA_BW_HZ);
+  LoRa.setCodingRate4(5);
+  // Payload CRC: near the edge of range a packet can arrive with damaged
+  // bytes; without a CRC it was accepted and could carry wrong coordinates.
+  // Damaged packets are now dropped by the radio (parsePacket() returns 0).
+  LoRa.enableCrc();
+}
+
+uint8_t readLoRaRegister(uint8_t reg) {
+  digitalWrite(TFT_CS, HIGH);
+  digitalWrite(TOUCH_CS, HIGH);
+  SPI.beginTransaction(SPISettings(8000000, MSBFIRST, SPI_MODE0));
+  digitalWrite(LORA_CS, LOW);
+  SPI.transfer(reg & 0x7F);
+  uint8_t value = SPI.transfer(0x00);
+  digitalWrite(LORA_CS, HIGH);
+  SPI.endTransaction();
+  return value;
+}
+
+// A supply dip during a 20 dBm transmission (~120 mA) can reset the radio
+// chip. It then comes back on its power-on defaults (433 MHz-band frequency,
+// SF7): it can no longer hear or be heard, and the device shows the others -
+// and the others show it - OFFLINE until it is restarted. Every 10 s the
+// key registers are checked and the radio is set up again if they changed.
+void checkRadioHealth() {
+  uint8_t version = readLoRaRegister(0x42);            // RegVersion: 0x12
+  uint8_t opMode = readLoRaRegister(0x01);             // bit 7 = LoRa mode
+  uint8_t sf = readLoRaRegister(0x1E) >> 4;            // RegModemConfig2
+  uint8_t frfMsb = readLoRaRegister(0x06);             // RegFrfMsb
+  uint8_t expectedFrfMsb = (uint8_t)((((uint64_t)LORA_FREQ << 19) / 32000000ULL) >> 16);
+  if (version == 0x12 && (opMode & 0x80) && sf == LORA_SF && frfMsb == expectedFrfMsb) return;
+
+  Serial.printf("LORA RADIO LOST ITS SETTINGS (version=0x%02X opmode=0x%02X sf=%u frf=0x%02X) -> re-initializing\n",
+                version, opMode, sf, frfMsb);
+  if (!LoRa.begin(LORA_FREQ)) {
+    Serial.println("LORA RADIO NOT RESPONDING - check its 3.3 V/VIN supply and wiring");
+    return;
+  }
+  configureLoRaRadio();
+  if (radioSleeping) LoRa.sleep();
+  else LoRa.receive();
+}
+
 // If the display controller lost its setup (power dip, glitch on the SPI
 // lines), re-initialize it and redraw the current screen so it never stays
 // frozen.
@@ -4700,9 +4825,9 @@ void loop() {
     // In proximity sleep, reports are sent by serviceProximitySleep().
     // Held while a ping waits for its reply (at most PING_REPLY_WINDOW): a
     // heartbeat on air would make this radio deaf to the reply.
-    if ((long)(millis() - nextHeartbeat) >= 0 && !pingPending) {
+    if (!pingPending && heartbeatDue()) {
       sendHeartbeat();
-      nextHeartbeat = millis() + HEARTBEAT_INTERVAL + (unsigned long)random(HEARTBEAT_JITTER_MS + 1);
+      heartbeatSent();
     }
   }
 
@@ -4722,11 +4847,23 @@ void loop() {
     forceRefresh = true;
     lastScreenRefresh = millis();
     Serial.println("PACKET TEST over: screen resumed");
+    // One-way result, counted here: the tester's own screen only knows
+    // about packets whose reply made it back.
+    if (peerTestRxCount > 0 && peerTestDevice >= 1 && peerTestDevice <= 3) {
+      int pct = (peerTestRxCount * 100) / TEST_PACKET_COUNT;
+      peerTestResultMessage = "Test from LORA #" + String(peerTestDevice) + ": got " +
+                              String(peerTestRxCount) + "/" + String(TEST_PACKET_COUNT) +
+                              " (" + String(pct) + "%)";
+      peerTestResultAt = millis();
+      Serial.printf("PACKET TEST RX from=%d received=%d sent=%d pct=%d\n",
+                    peerTestDevice, peerTestRxCount, TEST_PACKET_COUNT, pct);
+    }
   }
   if (millis() - lastScreenRefresh >= SCREEN_REFRESH_INTERVAL) {
     lastScreenRefresh = millis();
     forceRefresh = true;
     checkDisplayHealth();
+    checkRadioHealth();
   }
 
   if (currentScreen == MAIN_MENU) {
