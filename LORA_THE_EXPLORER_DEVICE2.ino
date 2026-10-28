@@ -1,6 +1,6 @@
-// Current Version: v2.2.5.1
-// Fixed devices showing OFFLINE during and right after a packet test and flickering OFFLINE at long range, and packet tests reading 0/20 when only the replies were lost.
-// No device is timed out while a packet test runs (heartbeats are held then) or for 10 s after; awake devices go OFFLINE after 26 s (5 heartbeats) instead of 16 s; the device answering a test now shows its own count ("Test from LORA #1: got 17/20") for 60 s, and the tester says when no reply came back; the radio's settings are checked every 10 s and restored if a supply dip reset the chip.
+// Current Version: v2.2.5.2
+// Fixed radar dots on CHECK LOCATION pointing the wrong way or jumping, and dots not matching their row's distance; added a warning when the compass no longer matches its calibration.
+// The heading is now averaged as a direction (0.3 new / 0.7 old every 100 ms) so single noisy samples don't swing the dots; compass calibration saves the magnetic field strength and the heading line turns yellow "CHECK COMPASS" if it stays more than 30% off for 5 s (new antenna/metal/wiring near the sensor, or device tilted); dots are redrawn whenever the shown distance changes.
 
 #include <Arduino.h>
 #include <SPI.h>
@@ -112,6 +112,15 @@ int16_t magX = 0;
 int16_t magY = 0;
 int16_t magZ = 0;
 float heading = 0.0f;
+// Field strength seen during the last compass calibration (calibrated units;
+// 0 = not known, e.g. calibrated by an older build). If the strength seen
+// now stays far from it, the magnetic surroundings changed (new antenna,
+// connector, wiring, battery near the sensor) or the device is tilted, and
+// the heading - so the radar dot directions - can no longer be trusted.
+float magCalRadius = 0.0f;
+bool compassNeedsRecal = false;
+#define MAG_FIELD_TOLERANCE  0.30f     // +-30 % of the calibrated strength
+#define MAG_FIELD_CHECK_MS   5000UL    // must stay out (or back in) for 5 s
 String directionShort = "N";
 String directionLong = "North";
 
@@ -1441,9 +1450,43 @@ void updateCompass() {
   }
 
   readFailures = 0;
-  heading = calculateHeading();
+  // Smoothed heading (averaged as a direction, so 359/1 deg average to 0):
+  // single noisy samples no longer make the radar dots jump.
+  static float smoothSin = 0.0f, smoothCos = 1.0f;
+  static bool smoothStarted = false;
+  float rawRad = calculateHeading() * PI / 180.0f;
+  if (!smoothStarted) {
+    smoothSin = sinf(rawRad);
+    smoothCos = cosf(rawRad);
+    smoothStarted = true;
+  } else {
+    smoothSin = 0.7f * smoothSin + 0.3f * sinf(rawRad);
+    smoothCos = 0.7f * smoothCos + 0.3f * cosf(rawRad);
+  }
+  heading = normalizeBearing(atan2f(smoothSin, smoothCos) * 180.0f / PI);
   directionShort = shortDirection(heading);
   directionLong = longDirection(heading);
+
+  // Field strength check against the calibration (see magCalRadius).
+  if (magCalRadius > 0.0f) {
+    static unsigned long changedSince = 0;
+    float cx = ((float)magX - magCal[0]) * magCal[2];
+    float cy = ((float)magY - magCal[1]) * magCal[3];
+    float ratio = sqrtf(cx * cx + cy * cy) / magCalRadius;
+    bool off = ratio < 1.0f - MAG_FIELD_TOLERANCE || ratio > 1.0f + MAG_FIELD_TOLERANCE;
+    if (off != compassNeedsRecal) {
+      if (changedSince == 0) changedSince = millis();
+      if (millis() - changedSince >= MAG_FIELD_CHECK_MS) {
+        compassNeedsRecal = off;
+        changedSince = 0;
+        Serial.printf("COMPASS %s (field %.0f%% of calibration)\n",
+                      off ? "OUT OF CALIBRATION - hold flat, keep metal away, or recalibrate"
+                          : "back within calibration", ratio * 100.0f);
+      }
+    } else {
+      changedSince = 0;
+    }
+  }
 }
 
 // Raw angle of a magnetometer sample after hard/soft-iron correction. This is
@@ -3317,7 +3360,7 @@ void updatePeerDynamicText(const String &locationText, bool locationOk,
     // Clear only the magnetometer row, then center the complete value.
     tft.fillRect(2, 254, SCREEN_W - 4, 11, BLACK);
     tft.setTextSize(1);
-    tft.setTextColor(headingOk ? WHITE : GRAY, BLACK);
+    tft.setTextColor(!headingOk ? GRAY : (compassNeedsRecal ? YELLOW : WHITE), BLACK);
 
     int16_t x1, y1;
     uint16_t w, h;
@@ -3375,7 +3418,12 @@ void updatePeerLocationDynamic(bool force) {
   bool headingOk = magnetometerPresent;
   if (magnetometerPresent) {
     char buf[50];
-    snprintf(buf, sizeof(buf), "%d%c, %s", (int)roundf(heading), 247, directionLong.c_str());
+    if (compassNeedsRecal) {
+      snprintf(buf, sizeof(buf), "%d%c %s - CHECK COMPASS", (int)roundf(heading), 247,
+               directionShort.c_str());
+    } else {
+      snprintf(buf, sizeof(buf), "%d%c, %s", (int)roundf(heading), 247, directionLong.c_str());
+    }
     headingText = buf;
   } else {
     headingText = "NO MAGNETOMETER FOUND!";
@@ -3390,7 +3438,22 @@ void updatePeerLocationDynamic(bool force) {
       fabsf(heading - lastPeerHeading) >= 1.0f) ||
     directionShort != lastPeerDirection;
 
-  bool peerGpsChanged = force ||
+  // The dot's distance from the centre follows the shown (rate-limited)
+  // distance, which keeps changing for a moment after a new position
+  // arrives; redraw when it changes so the dot matches its row.
+  static int lastPeerShownDistance[4] = {-1, -1, -1, -1};
+  bool shownDistanceChanged = false;
+  for (int id = 1; id <= 3; ++id) {
+    if (id == DEVICE_ID) continue;
+    int shown = (localLocationValid() && remoteLocationFresh(id))
+      ? (int)roundf(peerDisplayDistance(id)) : -1;
+    if (shown != lastPeerShownDistance[id]) {
+      lastPeerShownDistance[id] = shown;
+      shownDistanceChanged = true;
+    }
+  }
+
+  bool peerGpsChanged = force || shownDistanceChanged ||
     localLocationValid() != lastPeerGpsFix ||
     remoteLocationFresh(1) != lastPeerGpsFresh[1] ||
     remoteLocationFresh(2) != lastPeerGpsFresh[2] ||
@@ -3841,6 +3904,7 @@ void runTouchCalibration() {
 void loadMagCalibration() {
   Preferences prefs;
   prefs.begin("mag", true);
+  magCalRadius = prefs.getFloat("r", 0.0f);
   size_t len = prefs.getBytesLength("cal");
   if (len == sizeof(magCal)) {
     prefs.getBytes("cal", magCal, sizeof(magCal));
@@ -4020,6 +4084,19 @@ void runMagCalibration() {
   Preferences prefs;
   prefs.begin("mag", false);
   prefs.putBytes("cal", magCal, sizeof(magCal));
+  // Average field strength of this calibration, for the check in
+  // updateCompass().
+  {
+    double sumR = 0.0;
+    for (int i = 0; i < sampleCount; ++i) {
+      float cx = ((float)sampleX[i] - magCal[0]) * magCal[2];
+      float cy = ((float)sampleY[i] - magCal[1]) * magCal[3];
+      sumR += sqrtf(cx * cx + cy * cy);
+    }
+    magCalRadius = sampleCount ? (float)(sumR / sampleCount) : 0.0f;
+    compassNeedsRecal = false;
+    prefs.putFloat("r", magCalRadius);
+  }
   prefs.end();
 
   Serial.printf("COMPASS CALIBRATION SAVED: offset X=%.1f Y=%.1f  scale X=%.3f Y=%.3f  zero=%.1f dir=%+.0f\n",
