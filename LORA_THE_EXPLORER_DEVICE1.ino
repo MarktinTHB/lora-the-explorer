@@ -1,6 +1,6 @@
-// Current Version: v2.1.5.2
-// Fixed radar dots on CHECK LOCATION pointing the wrong way or jumping, and dots not matching their row's distance; added a warning when the compass no longer matches its calibration.
-// The heading is now averaged as a direction (0.3 new / 0.7 old every 100 ms) so single noisy samples don't swing the dots; compass calibration saves the magnetic field strength and the heading line turns yellow "CHECK COMPASS" if it stays more than 30% off for 5 s (new antenna/metal/wiring near the sensor, or device tilted); dots are redrawn whenever the shown distance changes.
+// Current Version: v2.1.6.1
+// Added a packet test pace setting (FAST / SLOW) on the developer screen to check whether the fast test pace causes the low LORA #1 -> LORA #3 results.
+// TEST PACE: SLOW sends one test packet every 1.15 s (the v2.x.5.x transmit pace) and tells receivers the interval in the test packet; FAST stays at 0.32 s with unchanged packets; receivers end the test from that interval and release it as soon as the result request arrives; the pace is shown on the result screen and in the serial log. Radio settings unchanged.
 
 #include <Arduino.h>
 #include <SPI.h>
@@ -167,6 +167,19 @@ Screen currentScreen = MAIN_MENU;
 double latitude = 0.0;
 double longitude = 0.0;
 bool gpsHasFix = false;
+
+// Shared GPS time for the heartbeat slots and the sleep listening window.
+// The NEO-6M sends its time in several sentences each second (RMC first, the
+// last one up to ~0.8 s later depending on how many satellites it lists),
+// and the old "time + age" used whichever came last - so two devices seeing
+// different satellites were up to ~0.2 s apart, enough for their
+// heartbeats (0.66 s on air, slots 0.8 s apart) to overlap and drop. Now
+// the offset between GPS time and millis() is taken from the EARLIEST
+// sentence of each second (largest "GPS time - local time"; any delay -
+// later sentence, busy loop - only makes it smaller).
+int64_t gpsTimeOffsetMs = 0;
+bool gpsTimeOffsetValid = false;
+unsigned long gpsTimeOffsetUpdatedAt = 0;
 
 // Position smoothing: while the device stands still, latitude/longitude are
 // the average of the last GPS_SMOOTH_SAMPLES fixes (1 per second), which
@@ -934,6 +947,30 @@ void updateGPS() {
                   gps.hdop.isValid() ? gps.hdop.hdop() : 99.9,
                   gps.location.isValid() ? 1 : 0,
                   gps.location.isValid() ? (long)gps.location.age() : -1L);
+  }
+
+  // GPS time -> local clock offset (see gpsTimeOffsetMs). isUpdated() is
+  // checked right after decoding, before anything reads the time.
+  if (gps.time.isUpdated() && gps.time.isValid()) {
+    unsigned long now = millis();
+    int64_t fieldMs = ((int64_t)gps.time.hour() * 3600LL + (int64_t)gps.time.minute() * 60LL +
+                       (int64_t)gps.time.second()) * 1000LL + (int64_t)gps.time.centisecond() * 10LL;
+    int64_t candidate = fieldMs - (int64_t)now;
+    static unsigned long lastDecayAt = 0;
+    if (!gpsTimeOffsetValid || candidate - gpsTimeOffsetMs > 5000LL ||
+        gpsTimeOffsetMs - candidate > 5000LL) {
+      gpsTimeOffsetMs = candidate;      // first time, midnight, or after a long gap
+      lastDecayAt = now;
+    } else {
+      // Drift down 1 ms per second so a stale best value doesn't stick;
+      // any earlier-arriving sentence pulls it straight back up.
+      unsigned long seconds = (now - lastDecayAt) / 1000UL;
+      lastDecayAt += seconds * 1000UL;
+      int64_t decayed = gpsTimeOffsetMs - (int64_t)seconds;
+      gpsTimeOffsetMs = candidate > decayed ? candidate : decayed;
+    }
+    gpsTimeOffsetValid = true;
+    gpsTimeOffsetUpdatedAt = now;
   }
 
   bool fixFresh = gps.location.isValid() && gps.location.age() <= 5000UL;
@@ -1996,8 +2033,8 @@ void receiveLoRa() {
   Serial.print("LoRa RX: ");
   Serial.println(packet);
 
-  // PACKET TEST: T,<sender>,<seq> and replies TR,<responder>,<to>,<seq>,<rssi>,<snr>
-  if (packet.startsWith("T,") || packet.startsWith("TR,")) {
+  // PACKET TEST: T,<tester>,<seq> / TQ,<tester>,<try> / TS,<responder>,<tester>,<received>,<rssi>,<snr>
+  if (packet.startsWith("T,") || packet.startsWith("TQ,") || packet.startsWith("TS,")) {
     handlePacketTest(packet, packetReceivedAt);
     LoRa.receive();
     return;
@@ -2462,12 +2499,11 @@ const char *proximityStateName(ProximityState state) {
 // listening windows of the three devices. Accuracy is limited by NMEA
 // sentence latency (typically well under 1 s), which the 2 s window absorbs.
 bool gpsUtcMillisOfDay(uint32_t &msOfDay) {
-  if (!gps.time.isValid() || gps.time.age() > 2000UL) return false;
-  uint32_t t = ((uint32_t)gps.time.hour() * 3600UL +
-                (uint32_t)gps.time.minute() * 60UL +
-                (uint32_t)gps.time.second()) * 1000UL +
-               (uint32_t)gps.time.centisecond() * 10UL + gps.time.age();
-  msOfDay = t % 86400000UL;
+  // Valid while GPS time sentences keep arriving (see updateGPS()).
+  if (!gpsTimeOffsetValid || millis() - gpsTimeOffsetUpdatedAt > 3000UL) return false;
+  int64_t t = ((int64_t)millis() + gpsTimeOffsetMs) % 86400000LL;
+  if (t < 0) t += 86400000LL;
+  msOfDay = (uint32_t)t;
   return true;
 }
 
@@ -4118,48 +4154,64 @@ void runMagCalibration() {
 // =====================================================
 // PACKET TEST
 // Double-tap the TIME on the main menu. This device sends TEST_PACKET_COUNT
-// test packets; every awake peer echoes each one back in its own time slot
-// (so peers never collide), and peers hold their heartbeats until it ends.
-// The result shows, per peer, how many test packets it received (one way),
-// how many replies came back, the round-trip time, and signal both ways.
+// test packets back to back; every awake peer counts the ones it receives
+// (and their signal) and holds its heartbeats until the test is over. Then
+// this device asks each peer for its count (TQ) and each peer answers once,
+// in its own time slot (TS). Both screens show the same number: the packets
+// the peer received (one way - the thesis packet success rate).
+// (v2.x.6.0: replaces the per-packet echo, which needed 1.15 s per packet at
+// SF10 and could end early on the receiving side.)
 // =====================================================
 
 #define TEST_PACKET_COUNT 20
-// SF10: a test packet takes ~0.25 s and a reply ~0.37 s on air. The two
-// responders reply one after the other (slots by rank, not ID), then the
-// next test packet follows: 0.25 + 0.01 + 2 x 0.42 s + margin = 1.15 s.
-// 20 packets take ~23 s.
-#define TEST_PACKET_INTERVAL 1150UL
+// A test packet takes ~0.25 s on air at SF10; the rest is time for the
+// receivers to read it. 20 packets take ~6.4 s.
+#define TEST_PACKET_INTERVAL 320UL
+// Developer setting "TEST PACE: SLOW": one packet every 1.15 s, the same
+// transmit pace as the v2.x.5.x test (the tester's radio then transmits
+// ~22% of the time instead of ~78%). For checking whether the fast pace
+// affects a device; 20 packets take ~23 s.
+#define TEST_PACKET_INTERVAL_SLOW 1150UL
+bool testPaceSlow = false;
+unsigned long packetTestInterval() {
+  return testPaceSlow ? TEST_PACKET_INTERVAL_SLOW : TEST_PACKET_INTERVAL;
+}
+// Result answers (TS, ~0.37 s on air) go out one after the other.
 #define TEST_REPLY_SLOT 420UL
-
-// One entry per test packet per peer.
-struct PacketSample {
-  bool received;
-  uint16_t rttMs;
-  int16_t rssiHere;    // RSSI of the reply, measured on this device
-  float snrHere;
-  int16_t rssiThere;   // RSSI of our packet, measured on the peer
-  float snrThere;
-};
+// Result request: up to 3 tries, each waiting for both answers.
+#define TEST_QUERY_TRIES 3
+#define TEST_QUERY_WAIT_MS 1300UL
+// How long a receiver keeps its test open after the last expected packet,
+// so it can answer all result requests.
+#define TEST_SUMMARY_WINDOW_MS (TEST_QUERY_TRIES * TEST_QUERY_WAIT_MS + 800UL)
 
 bool packetTestRunning = false;
 int packetTestId = 0;
-// Set while another device's test packets are arriving, so this device
-// doesn't start its own test at the same time (the packets would collide).
+// Set while another device's test is running here, so this device doesn't
+// start its own test at the same time (the packets would collide).
 unsigned long peerTestActiveUntil = 0;
 int peerTestDevice = 0;
-// Test packets received from the device that is testing (one-way count,
-// sent back in every reply so the tester can show the delivery rate).
+// Receiving side: packets received in the current test, and their signal.
 int peerTestRxCount = 0;
 int peerTestLastSeq = -1;
-unsigned long packetTestSentAt[TEST_PACKET_COUNT];
-PacketSample packetSamples[4][TEST_PACKET_COUNT];
-// Highest one-way count each peer reported in this test (-1 = not reported).
-int packetTestDelivered[4];
+long peerTestRssiSum = 0;
+float peerTestSnrSum = 0.0f;
+unsigned long peerTestLastRxAt = 0;
+bool peerTestSummarySent = false;
 
-// Each device answers in its own slot so replies from #2 and #3 don't collide.
-// The two responders take slots 1 and 2 in ID order (the tester's own ID
-// is skipped), so no slot is wasted.
+// Testing side: each peer's answer to the result request.
+struct PacketTestAnswer {
+  bool answered;
+  int received;        // test packets that peer received
+  int rssiThere;       // average signal of those packets, measured there
+  float snrThere;
+  int rssiHere;        // signal of the answer, measured here
+  float snrHere;
+};
+PacketTestAnswer packetTestAnswers[4];
+
+// Answer slots: the two receivers take slots 1 and 2 in ID order (the
+// tester's own ID is skipped), so no slot is wasted.
 unsigned long packetTestReplyDelay(int id, int testerId) {
   int rank = (testerId >= 1 && testerId < id) ? id - 1 : id;   // 1 or 2
   return 10UL + (unsigned long)(rank - 1) * TEST_REPLY_SLOT;
@@ -4175,6 +4227,18 @@ void sendRawLoRa(const String &packet) {
   LoRa.receive();
 }
 
+// Keep this device's test-receiving state open until untilMs: screen paused,
+// heartbeats held (a heartbeat on air would make this radio deaf to test
+// packets), and no device timed out meanwhile.
+void holdForPeerTest(unsigned long untilMs) {
+  if ((long)(untilMs - peerTestActiveUntil) > 0) peerTestActiveUntil = untilMs;
+  statusTimeoutHoldUntil = peerTestActiveUntil + 2UL * HEARTBEAT_INTERVAL;
+  // Staggered by device ID so the held heartbeats don't all go out at once.
+  unsigned long resumeAt = peerTestActiveUntil + (unsigned long)(DEVICE_ID - 1) * 250UL +
+                           (unsigned long)random(HEARTBEAT_JITTER_MS + 1);
+  if ((long)(nextHeartbeat - resumeAt) < 0) nextHeartbeat = resumeAt;
+}
+
 // receivedAt = when the radio finished receiving this packet (DIO0
 // interrupt time, see receiveLoRa()), not when the loop got to it.
 void handlePacketTest(const String &packet, unsigned long receivedAt) {
@@ -4182,121 +4246,136 @@ void handlePacketTest(const String &packet, unsigned long receivedAt) {
   float snr = LoRa.packetSnr();
 
   if (packet.startsWith("T,")) {
-    // T,<sender>,<seq> -> echo it back.
+    // T,<tester>,<seq>[,<interval ms>]: count it. (toInt() stops at a
+    // comma, so the interval field doesn't disturb the sequence number.)
     int comma = packet.indexOf(',', 2);
     if (comma < 0) return;
     int sender = packet.substring(2, comma).toInt();
     int seq = packet.substring(comma + 1).toInt();
+    int comma2 = packet.indexOf(',', comma + 1);
+    unsigned long interval = comma2 < 0 ? TEST_PACKET_INTERVAL
+                                        : (unsigned long)packet.substring(comma2 + 1).toInt();
+    if (interval < TEST_PACKET_INTERVAL || interval > 5000UL) interval = TEST_PACKET_INTERVAL;
     if (sender < 1 || sender > 3 || sender == DEVICE_ID || sleepMode) return;
+    if (seq < 0 || seq >= TEST_PACKET_COUNT) return;
+    // Busy with our own test: don't take part in another one.
+    if (packetTestRunning) return;
 
-    // A new test (other sender, earlier one finished, or sequence restarted)
-    // restarts the one-way count.
-    if (sender != peerTestDevice || (long)(peerTestActiveUntil - millis()) <= 0 ||
-        seq <= peerTestLastSeq) {
+    // A new test: other tester, sequence restarted, or the previous test's
+    // time is over. Missing a few packets in a row no longer ends the test
+    // early: its end is worked out from the sequence number.
+    if (sender != peerTestDevice || seq <= peerTestLastSeq ||
+        (long)(millis() - peerTestActiveUntil) > 0) {
       peerTestRxCount = 0;
+      peerTestRssiSum = 0;
+      peerTestSnrSum = 0.0f;
+      peerTestSummarySent = false;
+      peerTestActiveUntil = millis();
     }
     ++peerTestRxCount;
+    peerTestRssiSum += rssi;
+    peerTestSnrSum += snr;
     peerTestLastSeq = seq;
-
-    peerTestActiveUntil = millis() + 2UL * TEST_PACKET_INTERVAL + 500UL;
     peerTestDevice = sender;
-    statusTimeoutHoldUntil = peerTestActiveUntil + 2UL * HEARTBEAT_INTERVAL;
+    peerTestLastRxAt = millis();
 
-    // Hold this device's heartbeat until the test is over. While a heartbeat
-    // is on air this radio cannot hear the next test packet, and it collides
-    // with the other replies (a timing model puts this at ~3 of every 20).
-    // Staggered by device ID so the held heartbeats don't all go out at once.
-    unsigned long resumeAt = peerTestActiveUntil + (unsigned long)(DEVICE_ID - 1) * 250UL +
-                             (unsigned long)random(HEARTBEAT_JITTER_MS + 1);
-    if ((long)(nextHeartbeat - resumeAt) < 0) nextHeartbeat = resumeAt;
-
-    // Busy with our own test: don't transmit over it.
-    if (packetTestRunning) return;
+    unsigned long lastPacketAt = receivedAt +
+      (unsigned long)(TEST_PACKET_COUNT - 1 - seq) * interval;
+    holdForPeerTest(lastPacketAt + TEST_SUMMARY_WINDOW_MS);
 
     remote[sender].lastSeen = millis();
     remote[sender].online = true;
     cachedRemoteOnline[sender] = true;
 
-    // Reply in this device's slot, counted from when the test packet
-    // ARRIVED. Counting from when the loop read it (after a screen redraw,
-    // say) made late replies run into the next test packet, which this
-    // radio then could not hear. A reply that can no longer finish before
-    // the next test packet is skipped: the following reply still reports
-    // the received count, so the delivery result is unaffected.
-    String reply = "TR," + String(DEVICE_ID) + "," + String(sender) + "," +
-                   String(seq) + "," + String(rssi) + "," + String(snr, 1) + "," +
-                   String(peerTestRxCount);
-    unsigned long replyAt = receivedAt + packetTestReplyDelay(DEVICE_ID, sender);
-    // Next test packet starts TEST_PACKET_INTERVAL after this one started,
-    // i.e. (interval - this packet's airtime) after it arrived.
-    unsigned long nextPacketAt = receivedAt + TEST_PACKET_INTERVAL -
-      (unsigned long)estimateLoRaToAMs((uint8_t)packet.length());
-    unsigned long replyAirtime = (unsigned long)estimateLoRaToAMs((uint8_t)reply.length()) + 10UL;
-    unsigned long now = millis();
-    if ((long)(now - replyAt) < 0) {
-      delay(replyAt - now);
-    } else if ((long)(now + replyAirtime - nextPacketAt) > 0) {
-      Serial.printf("TEST REPLY SKIPPED seq=%d (%lu ms late)\n", seq, now - replyAt);
-      return;
-    }
-    sendRawLoRa(reply);
+    // Per-packet log on the receiving side (the tester no longer knows
+    // which packets arrived): TESTRX,device,from,seq,rssi,snr
+    Serial.printf("TESTRX,%d,%d,%d,%d,%.1f\n", DEVICE_ID, sender, seq, rssi, snr);
     return;
   }
 
-  // TR,<responder>,<to>,<seq>,<rssi>,<snr>,<received>
-  // (<received> = test packets the responder got so far; older firmware omits it)
-  String f[6];
-  int startIndex = 3;
-  int count = 0;
-  while (count < 6) {
-    int comma = packet.indexOf(',', startIndex);
-    if (comma < 0) {
-      f[count++] = packet.substring(startIndex);
-      break;
+  if (packet.startsWith("TQ,")) {
+    // TQ,<tester>,<try>: answer with this device's count for that test.
+    int comma = packet.indexOf(',', 3);
+    int tester = (comma < 0 ? packet.substring(3) : packet.substring(3, comma)).toInt();
+    if (tester < 1 || tester > 3 || tester == DEVICE_ID || sleepMode || packetTestRunning) return;
+
+    remote[tester].lastSeen = millis();
+    remote[tester].online = true;
+    cachedRemoteOnline[tester] = true;
+
+    // Count only if this device was receiving that tester's test (a
+    // device that received none of its packets answers 0).
+    bool ours = tester == peerTestDevice && peerTestLastRxAt != 0 &&
+                millis() - peerTestLastRxAt < 60000UL;
+    int received = ours ? peerTestRxCount : 0;
+    int avgRssi = received ? (int)(peerTestRssiSum / received) : 0;
+    float avgSnr = received ? peerTestSnrSum / received : 0.0f;
+    if (!ours) {
+      peerTestDevice = tester;
+      peerTestRxCount = 0;
+      peerTestLastSeq = -1;
+      peerTestLastRxAt = millis();
     }
-    f[count++] = packet.substring(startIndex, comma);
-    startIndex = comma + 1;
-  }
-  if (count < 5) return;
+    // The test is over: keep the test state only for the result request
+    // retries (replaces the end time worked out from the packets).
+    peerTestActiveUntil = millis();
+    holdForPeerTest(millis() + TEST_QUERY_WAIT_MS + 500UL);
 
-  int responder = f[0].toInt();
-  int to = f[1].toInt();
-  int seq = f[2].toInt();
-  if (responder < 1 || responder > 3 || responder == DEVICE_ID) return;
+    unsigned long replyAt = receivedAt + packetTestReplyDelay(DEVICE_ID, tester);
+    unsigned long now = millis();
+    if ((long)(now - replyAt) < 0) delay(replyAt - now);
+    sendRawLoRa("TS," + String(DEVICE_ID) + "," + String(tester) + "," + String(received) + "," +
+                String(avgRssi) + "," + String(avgSnr, 1));
 
-  // Any valid reply proves the responder is awake, even one addressed to
-  // another device: heartbeats are held during a test, so this keeps the
-  // two responders from marking each other OFFLINE.
-  remote[responder].lastSeen = millis();
-  remote[responder].online = true;
-  cachedRemoteOnline[responder] = true;
-
-  if (!packetTestRunning || to != DEVICE_ID) return;
-  if (seq < 0 || seq >= TEST_PACKET_COUNT || packetTestSentAt[seq] == 0) return;
-
-  if (count >= 6) {
-    int delivered = f[5].toInt();
-    if (delivered >= 1 && delivered <= TEST_PACKET_COUNT &&
-        delivered > packetTestDelivered[responder]) {
-      packetTestDelivered[responder] = delivered;
+    // The result on this screen is exactly the number sent to the tester.
+    int pct = (received * 100) / TEST_PACKET_COUNT;
+    peerTestResultMessage = "Test from LORA #" + String(tester) + ": got " +
+                            String(received) + "/" + String(TEST_PACKET_COUNT) +
+                            " (" + String(pct) + "%)";
+    peerTestResultAt = millis();
+    if (!peerTestSummarySent) {
+      Serial.printf("PACKET TEST RX from=%d received=%d sent=%d pct=%d avg_rssi=%d avg_snr=%.1f\n",
+                    tester, received, TEST_PACKET_COUNT, pct, avgRssi, avgSnr);
     }
+    peerTestSummarySent = true;
+    return;
   }
 
-  PacketSample &s = packetSamples[responder][seq];
-  if (s.received) return;   // duplicate
+  if (packet.startsWith("TS,")) {
+    // TS,<responder>,<tester>,<received>,<rssi>,<snr>
+    String f[5];
+    int startIndex = 3;
+    int count = 0;
+    while (count < 5) {
+      int comma = packet.indexOf(',', startIndex);
+      if (comma < 0) {
+        f[count++] = packet.substring(startIndex);
+        break;
+      }
+      f[count++] = packet.substring(startIndex, comma);
+      startIndex = comma + 1;
+    }
+    if (count < 5) return;
+    int responder = f[0].toInt();
+    int tester = f[1].toInt();
+    int received = f[2].toInt();
+    if (responder < 1 || responder > 3 || responder == DEVICE_ID) return;
 
-  // A late reply (arriving after the next packet was sent) still counts,
-  // timed against its own packet, up to when the radio received the reply.
-  unsigned long rtt = receivedAt - packetTestSentAt[seq];
-  unsigned long slot = packetTestReplyDelay(responder, DEVICE_ID);
-  rtt = rtt > slot ? rtt - slot : 0;
+    // Any answer proves the responder is awake.
+    remote[responder].lastSeen = millis();
+    remote[responder].online = true;
+    cachedRemoteOnline[responder] = true;
 
-  s.received = true;
-  s.rttMs = (uint16_t)min(rtt, 65535UL);
-  s.rssiHere = rssi;
-  s.snrHere = snr;
-  s.rssiThere = f[3].toInt();
-  s.snrThere = f[4].toFloat();
+    if (!packetTestRunning || tester != DEVICE_ID) return;
+    if (received < 0 || received > TEST_PACKET_COUNT) return;
+    PacketTestAnswer &a = packetTestAnswers[responder];
+    a.answered = true;
+    a.received = received;
+    a.rssiThere = f[3].toInt();
+    a.snrThere = f[4].toFloat();
+    a.rssiHere = rssi;
+    a.snrHere = snr;
+  }
 }
 
 // Keep receiving and sending heartbeats while a blocking screen is shown,
@@ -4500,35 +4579,21 @@ String csvDistance(float meters) {
   return meters < 0 ? String("") : String(meters, 1);
 }
 
-// Serial CSV output (saved on the PC by tools/packet_logger.py):
-// CSV,device,test,seq,peer,status,rtt_ms,rssi_here,snr_here,rssi_there,snr_there,distance_m,own_lat,own_lon,peer_lat,peer_lon
-// SUM,device,test,peer,received,sent,success_pct,avg_rtt_ms,avg_rssi_here,avg_snr_here,avg_rssi_there,avg_snr_there,distance_m,delivered,delivered_pct,raw_distance_m
-// received/success_pct = round trips (packet there AND reply back);
-// delivered/delivered_pct = packets the peer received (one way, the thesis
-// packet success rate; blank if the peer runs older firmware).
-void printPacketTestCsv() {
-  for (int id = 1; id <= 3; id++) {
-    if (id == DEVICE_ID) continue;
-    String dist = csvDistance(packetTestDistance(id));
-    String ownPos = gpsHasFix ? String(latitude, 6) + "," + String(longitude, 6) : String(",");
-    String peerPos = remote[id].gpsValid
-      ? String(remote[id].lat, 6) + "," + String(remote[id].lon, 6) : String(",");
+// Serial output (saved on the PC by tools/packet_logger.py):
+// On the receiving device, one line per test packet:
+//   TESTRX,device,from,seq,rssi,snr
+// On the testing device, one line per peer:
+//   SUM,device,test,peer,received,sent,success_pct,avg_rtt_ms,avg_rssi_here,avg_snr_here,avg_rssi_there,avg_snr_there,distance_m,delivered,delivered_pct,raw_distance_m
+// received/delivered = packets that peer received (both columns kept so
+// existing spreadsheets still line up); avg_rtt_ms is blank (no per-packet
+// echo any more - ping measures latency); rssi_here = the peer's answer
+// measured here, rssi_there = average of the test packets measured there.
 
-    for (int seq = 0; seq < TEST_PACKET_COUNT; seq++) {
-      PacketSample &s = packetSamples[id][seq];
-      String line = "CSV," + String(DEVICE_ID) + "," + String(packetTestId) + "," +
-                    String(seq) + "," + String(id) + ",";
-      if (s.received) {
-        line += "OK," + String(s.rttMs) + "," + String(s.rssiHere) + "," +
-                String(s.snrHere, 1) + "," + String(s.rssiThere) + "," +
-                String(s.snrThere, 1) + ",";
-      } else {
-        line += "LOST,,,,,,";
-      }
-      line += dist + "," + ownPos + "," + peerPos;
-      Serial.println(line);
-    }
+bool packetTestAllAnswered(const bool expected[4]) {
+  for (int id = 1; id <= 3; ++id) {
+    if (id != DEVICE_ID && expected[id] && !packetTestAnswers[id].answered) return false;
   }
+  return true;
 }
 
 void runPacketTest() {
@@ -4562,47 +4627,53 @@ void runPacketTest() {
   }
 
   packetTestId++;
-  memset(packetSamples, 0, sizeof(packetSamples));
-  memset(packetTestSentAt, 0, sizeof(packetTestSentAt));
-  for (int id = 0; id <= 3; id++) packetTestDelivered[id] = -1;
+  memset(packetTestAnswers, 0, sizeof(packetTestAnswers));
 
   tft.fillScreen(BLACK);
   drawCenteredText("PACKET TEST", 20, WHITE, BLACK, 2);
   drawCenteredText("Sending " + String(TEST_PACKET_COUNT) + " packets...", 50, YELLOW, BLACK, 1);
 
-  Serial.printf("PACKET TEST START device=%d test=%d\n", DEVICE_ID, packetTestId);
+  unsigned long interval = packetTestInterval();
+  Serial.printf("PACKET TEST START device=%d test=%d interval_ms=%lu\n", DEVICE_ID, packetTestId, interval);
   packetTestRunning = true;
 
-  // Packets go out on a fixed 300 ms schedule. The counter is redrawn right
-  // after each packet is sent (replies wait in the radio meanwhile), so the
-  // ~40 ms redraw no longer stretches the gap between packets.
+  // Packets go out on a fixed schedule. The counter is redrawn right after
+  // each packet is sent, inside the gap before the next one.
   unsigned long testStart = millis();
   for (int seq = 0; seq < TEST_PACKET_COUNT; seq++) {
-    unsigned long dueAt = testStart + (unsigned long)seq * TEST_PACKET_INTERVAL;
+    unsigned long dueAt = testStart + (unsigned long)seq * interval;
     while ((long)(millis() - dueAt) < 0) {
       receiveLoRa();
       updateGPS();
       delay(1);
     }
-    packetTestSentAt[seq] = millis();
-    sendRawLoRa("T," + String(DEVICE_ID) + "," + String(seq));
+    // The interval is sent along only in SLOW pace, so receivers keep the
+    // test open long enough (FAST packets are unchanged).
+    sendRawLoRa("T," + String(DEVICE_ID) + "," + String(seq) +
+                (testPaceSlow ? "," + String(interval) : String("")));
 
     tft.fillRect(0, 80, SCREEN_W, 40, BLACK);
     drawCenteredText(String(seq + 1) + " / " + String(TEST_PACKET_COUNT), 85, GREEN, BLACK, 2);
   }
-  // Let the last packet's reply slots pass before the grace period.
-  while ((long)(millis() - (testStart + (unsigned long)TEST_PACKET_COUNT * TEST_PACKET_INTERVAL)) < 0) {
-    receiveLoRa();
-    updateGPS();
-    delay(1);
-  }
 
-  // Short grace period for the last replies.
-  unsigned long graceStart = millis();
-  while (millis() - graceStart < TEST_PACKET_INTERVAL) {
-    receiveLoRa();
-    updateGPS();
-    delay(1);
+  // Ask for the results. Peers known to be offline or asleep are not waited
+  // for (they are still asked once, in case they are there after all).
+  bool expected[4] = {false, false, false, false};
+  for (int id = 1; id <= 3; ++id) {
+    if (id != DEVICE_ID) expected[id] = remote[id].online && !remote[id].asleep;
+  }
+  tft.fillRect(0, 130, SCREEN_W, 20, BLACK);
+  drawCenteredText("Getting results...", 135, YELLOW, BLACK, 1);
+  for (int attempt = 1; attempt <= TEST_QUERY_TRIES; ++attempt) {
+    sendRawLoRa("TQ," + String(DEVICE_ID) + "," + String(attempt));
+    unsigned long askedAt = millis();
+    while (millis() - askedAt < TEST_QUERY_WAIT_MS) {
+      receiveLoRa();
+      updateGPS();
+      delay(1);
+    }
+    if (packetTestAllAnswered(expected)) break;
+    Serial.printf("PACKET TEST: result request %d not answered by every peer\n", attempt);
   }
 
   packetTestRunning = false;
@@ -4611,53 +4682,21 @@ void runPacketTest() {
   // was not running): give them two cycles to be heard before any timeout.
   statusTimeoutHoldUntil = millis() + 2UL * HEARTBEAT_INTERVAL;
 
-  printPacketTestCsv();
-
   // ---- Results ----
   tft.fillScreen(BLACK);
   drawPacketTestClock(true);
   drawCenteredText("PACKET TEST RESULT", 15, WHITE, BLACK, 2);
-  drawCenteredText("Packets received by each device", 34, GRAY, BLACK, 1);
+  drawCenteredText(testPaceSlow ? "Packets received (SLOW pace)" : "Packets received by each device",
+                   34, GRAY, BLACK, 1);
 
   int y = 45;
-  bool anyReply = false;
+  bool anyAnswer = false;
   for (int id = 1; id <= 3; id++) {
     if (id == DEVICE_ID) continue;
 
-    int received = 0;
-    unsigned long rttSum = 0;
-    long rssiHereSum = 0, rssiThereSum = 0;
-    float snrHereSum = 0, snrThereSum = 0;
-    for (int seq = 0; seq < TEST_PACKET_COUNT; seq++) {
-      PacketSample &s = packetSamples[id][seq];
-      if (!s.received) continue;
-      received++;
-      rttSum += s.rttMs;
-      rssiHereSum += s.rssiHere;
-      snrHereSum += s.snrHere;
-      rssiThereSum += s.rssiThere;
-      snrThereSum += s.snrThere;
-    }
-    int pct = (received * 100) / TEST_PACKET_COUNT;
+    PacketTestAnswer &a = packetTestAnswers[id];
     float distance = packetTestDistance(id);
     float rawDistance = packetTestRawDistance(id);
-
-    // Headline = packets this peer received (one way), as in the thesis
-    // packet success rate. Every reply proves its packet arrived, so it is
-    // never below the round-trip count. Older peers don't report it: then
-    // the round-trip count is shown.
-    int delivered = packetTestDelivered[id];
-    bool oneWay = delivered >= 0;
-    if (oneWay && delivered < received) delivered = received;
-    int shownCount = oneWay ? delivered : received;
-    int shownPct = (shownCount * 100) / TEST_PACKET_COUNT;
-
-    uint16_t color = shownPct >= 90 ? GREEN : (shownPct >= 50 ? YELLOW : RED);
-    if (received == 0) color = GRAY;
-
-    drawCenteredText("LORA #" + String(id) + ": " + String(shownCount) + "/" +
-                     String(TEST_PACKET_COUNT) + " (" + String(shownPct) + "%)",
-                     y, color, BLACK, 2);
 
     String distText;
     if (distance < 0) {
@@ -4669,43 +4708,43 @@ void runPacketTest() {
       distText = "Distance: " + String((int)roundf(distance)) + " m (GPS, not calibrated)";
     }
 
-    String sum = "SUM," + String(DEVICE_ID) + "," + String(packetTestId) + "," +
-                 String(id) + "," + String(received) + "," + String(TEST_PACKET_COUNT) + "," +
-                 String(pct) + ",";
+    String sum = "SUM," + String(DEVICE_ID) + "," + String(packetTestId) + "," + String(id) + ",";
 
-    if (received > 0) {
-      anyReply = true;
-      String rttText = oneWay
-        ? "Replies back: " + String(received) + "/" + String(TEST_PACKET_COUNT) +
-          ", avg " + String(rttSum / received) + " ms"
-        : "Round trip only, avg " + String(rttSum / received) + " ms";
-      drawCenteredText(rttText, y + 25, WHITE, BLACK, 1);
-      drawCenteredText("Signal here:  " + String(rssiHereSum / received) + " dBm, SNR " +
-                       String(snrHereSum / received, 1) + " dB",
-                       y + 40, WHITE, BLACK, 1);
-      drawCenteredText("Signal there: " + String(rssiThereSum / received) + " dBm, SNR " +
-                       String(snrThereSum / received, 1) + " dB",
-                       y + 55, WHITE, BLACK, 1);
-      sum += String(rttSum / received) + "," + String(rssiHereSum / received) + "," +
-             String(snrHereSum / received, 1) + "," + String(rssiThereSum / received) + "," +
-             String(snrThereSum / received, 1) + ",";
+    if (a.answered) {
+      anyAnswer = true;
+      int pct = (a.received * 100) / TEST_PACKET_COUNT;
+      uint16_t color = pct >= 90 ? GREEN : (pct >= 50 ? YELLOW : RED);
+      drawCenteredText("LORA #" + String(id) + ": " + String(a.received) + "/" +
+                       String(TEST_PACKET_COUNT) + " (" + String(pct) + "%)",
+                       y, color, BLACK, 2);
+      if (a.received > 0) {
+        drawCenteredText("Signal at #" + String(id) + ": " + String(a.rssiThere) + " dBm, SNR " +
+                         String(a.snrThere, 1) + " dB", y + 25, WHITE, BLACK, 1);
+      } else {
+        drawCenteredText("None of the test packets arrived", y + 25, WHITE, BLACK, 1);
+      }
+      drawCenteredText("Signal here: " + String(a.rssiHere) + " dBm, SNR " +
+                       String(a.snrHere, 1) + " dB", y + 40, WHITE, BLACK, 1);
+      drawCenteredText("Same count shown on LORA #" + String(id), y + 55, GRAY, BLACK, 1);
+      sum += String(a.received) + "," + String(TEST_PACKET_COUNT) + "," + String(pct) + ",," +
+             String(a.rssiHere) + "," + String(a.snrHere, 1) + "," +
+             (a.received > 0 ? String(a.rssiThere) + "," + String(a.snrThere, 1) : String(",")) + "," +
+             csvDistance(distance) + "," + String(a.received) + "," + String(pct) + "," +
+             csvDistance(rawDistance);
     } else {
-      // No reply came back, so this device cannot know how many of its
-      // packets arrived; the peer counts them itself and shows the result.
-      drawCenteredText("No replies came back to this device", y + 25, GRAY, BLACK, 1);
-      drawCenteredText("Packets received: see LORA #" + String(id) + "'s screen", y + 40, YELLOW, BLACK, 1);
-      sum += ",,,,,";
+      drawCenteredText("LORA #" + String(id) + ": no answer", y, GRAY, BLACK, 2);
+      drawCenteredText("Its result did not come back here", y + 25, GRAY, BLACK, 1);
+      drawCenteredText("(OFF, asleep, or out of range)", y + 40, GRAY, BLACK, 1);
+      sum += "," + String(TEST_PACKET_COUNT) + ",,,,,,," + csvDistance(distance) + ",,," +
+             csvDistance(rawDistance);
     }
     drawCenteredText(distText, y + 70, distance < 0 ? GRAY : LOCATION_GREEN, BLACK, 1);
-    sum += csvDistance(distance) + ",";
-    sum += oneWay ? String(delivered) + "," + String(shownPct) + "," : String(",,");
-    sum += csvDistance(rawDistance);
     Serial.println(sum);
 
     y += 100;
   }
 
-  if (anyReply) {
+  if (anyAnswer) {
     drawCenteredText("RSSI: -30 great ... -130 at the limit", 255, GRAY, BLACK, 1);
   }
   drawCenteredText("Tap anywhere to go back", 295, YELLOW, BLACK, 1);
@@ -4730,14 +4769,17 @@ void loadDeveloperSettings() {
   Preferences prefs;
   prefs.begin("dev", true);
   proxSleepEnabled = prefs.getBool("proxOn", true);
+  testPaceSlow = prefs.getBool("slowTest", false);
   prefs.end();
-  Serial.printf("Developer: automatic proximity sleep %s\n", proxSleepEnabled ? "ON" : "OFF");
+  Serial.printf("Developer: automatic proximity sleep %s, packet test pace %s\n",
+                proxSleepEnabled ? "ON" : "OFF", testPaceSlow ? "SLOW" : "FAST");
 }
 
 void saveDeveloperSettings() {
   Preferences prefs;
   prefs.begin("dev", false);
   prefs.putBool("proxOn", proxSleepEnabled);
+  prefs.putBool("slowTest", testPaceSlow);
   prefs.end();
 }
 
@@ -4762,22 +4804,34 @@ bool readScreenTap(int &screenX, int &screenY) {
 }
 
 void drawDeveloperToggle() {
-  tft.fillRect(22, 110, 196, 48, proxSleepEnabled ? GREEN : GRAY);
-  drawCenteredText(proxSleepEnabled ? "AUTO SLEEP: ON" : "AUTO SLEEP: OFF", 127, BLACK,
+  tft.fillRect(22, 70, 196, 40, proxSleepEnabled ? GREEN : GRAY);
+  drawCenteredText(proxSleepEnabled ? "AUTO SLEEP: ON" : "AUTO SLEEP: OFF", 83, BLACK,
                    proxSleepEnabled ? GREEN : GRAY, 2);
-  tft.fillRect(0, 165, SCREEN_W, 30, BLACK);
+  tft.fillRect(0, 114, SCREEN_W, 12, BLACK);
   drawCenteredText(proxSleepEnabled ? "Group sleeps when all are < 10 m"
                                     : "Off: the whole group stays awake",
-                   170, WHITE, BLACK, 1);
-  drawCenteredText("(saved on this device)", 183, GRAY, BLACK, 1);
+                   116, WHITE, BLACK, 1);
+}
+
+void drawDeveloperPaceToggle() {
+  tft.fillRect(22, 155, 196, 40, testPaceSlow ? YELLOW : GREEN);
+  drawCenteredText(testPaceSlow ? "TEST PACE: SLOW" : "TEST PACE: FAST", 168, BLACK,
+                   testPaceSlow ? YELLOW : GREEN, 2);
+  tft.fillRect(0, 199, SCREEN_W, 12, BLACK);
+  drawCenteredText(testPaceSlow ? "1 packet / 1.15 s (about 23 s)"
+                                : "1 packet / 0.32 s (about 8 s)",
+                   201, WHITE, BLACK, 1);
 }
 
 void runDeveloperScreen() {
   Serial.println("DEVELOPER SCREEN");
   tft.fillScreen(BLACK);
   drawCenteredText("DEVELOPER", 20, YELLOW, BLACK, 2);
-  drawCenteredText("Proximity sleep (10 m)", 85, WHITE, BLACK, 1);
+  drawCenteredText("Proximity sleep (10 m)", 56, WHITE, BLACK, 1);
   drawDeveloperToggle();
+  drawCenteredText("Packet test pace (this device)", 141, WHITE, BLACK, 1);
+  drawDeveloperPaceToggle();
+  drawCenteredText("(settings saved on this device)", 222, GRAY, BLACK, 1);
   tft.fillRect(22, 240, 196, 48, WHITE);
   drawCenteredText("BACK", 257, BLACK, WHITE, 2);
 
@@ -4790,11 +4844,16 @@ void runDeveloperScreen() {
     int x, y;
     if (readScreenTap(x, y)) {
       lastActivity = millis();
-      if (x >= 22 && x < 218 && y >= 110 && y < 158) {
+      if (x >= 22 && x < 218 && y >= 70 && y < 110) {
         proxSleepEnabled = !proxSleepEnabled;
         saveDeveloperSettings();
         Serial.printf("Developer: automatic proximity sleep %s\n", proxSleepEnabled ? "ON" : "OFF");
         drawDeveloperToggle();
+      } else if (x >= 22 && x < 218 && y >= 155 && y < 195) {
+        testPaceSlow = !testPaceSlow;
+        saveDeveloperSettings();
+        Serial.printf("Developer: packet test pace %s\n", testPaceSlow ? "SLOW" : "FAST");
+        drawDeveloperPaceToggle();
       } else if (x >= 22 && x < 218 && y >= 240 && y < 288) {
         break;
       }
@@ -4924,15 +4983,18 @@ void loop() {
     forceRefresh = true;
     lastScreenRefresh = millis();
     Serial.println("PACKET TEST over: screen resumed");
-    // One-way result, counted here: the tester's own screen only knows
-    // about packets whose reply made it back.
-    if (peerTestRxCount > 0 && peerTestDevice >= 1 && peerTestDevice <= 3) {
+    // Normally the result was already shown when this device answered the
+    // tester's result request. If no request arrived, show the count anyway
+    // and say that the tester did not get it.
+    if (!peerTestSummarySent && peerTestRxCount > 0 &&
+        peerTestDevice >= 1 && peerTestDevice <= 3) {
       int pct = (peerTestRxCount * 100) / TEST_PACKET_COUNT;
-      peerTestResultMessage = "Test from LORA #" + String(peerTestDevice) + ": got " +
+      peerTestResultMessage = "LORA #" + String(peerTestDevice) + " test: got " +
                               String(peerTestRxCount) + "/" + String(TEST_PACKET_COUNT) +
-                              " (" + String(pct) + "%)";
+                              " (not sent back)";
       peerTestResultAt = millis();
-      Serial.printf("PACKET TEST RX from=%d received=%d sent=%d pct=%d\n",
+      peerTestSummarySent = true;
+      Serial.printf("PACKET TEST RX from=%d received=%d sent=%d pct=%d (no result request received)\n",
                     peerTestDevice, peerTestRxCount, TEST_PACKET_COUNT, pct);
     }
   }
