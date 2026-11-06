@@ -1,6 +1,6 @@
-// Current Version: v2.2.6.2
-// Fixed screen content hidden behind the enclosure's top edge: every screen now fits below it, with a cleaner, more compact main menu.
-// Layout only (no behaviour changes): main menu reflowed below y=28 (title, time, date, messages, buttons 44 px tall, device status) with thin gray dividers; CHECK LOCATION header, back arrow and radar moved down 23 px (radar size/scale unchanged); packet test and developer screen titles and the top touch-calibration crosses moved below the edge; tap areas moved with their buttons.
+// Current Version: v2.2.8.0
+// Added a sleep menu, hold-to-open packet testing and developer tools with pace, auto sleep distance and credits screens.
+// SLEEP MODE opens a menu with the manual sleep toggle and the auto sleep (GPS) toggle, each explained; the main menu shows only manual sleep; holding CHECK LOCATION 5 s runs the packet test and holding the time 5 s opens developer tools, with "Accessing ..." and a dot per second under the device status (title hold and time double-tap removed); developer tools: test pace SPEEDY 0.32 s / NORMAL 0.65 s / PRECISE 1.15 s, auto sleep distance NEAR 5 m / CLOSE 10 m (default) / FAR 50 m, and a credits screen with the version.
 
 #include <Arduino.h>
 #include <SPI.h>
@@ -21,6 +21,8 @@ void loop();
 // =====================================================
 
 #define DEVICE_ID 2
+// Shown on the developer tools' CREDITS screen.
+#define FIRMWARE_VERSION "v2.2.8.0"
 
 // =====================================================
 // TFT SPI
@@ -366,7 +368,10 @@ bool cachedRemoteAsleep[4] = {false, false, false, false};
 //  - Missing/stale GPS pauses the decision (PROX_UNKNOWN); it never counts
 //    as being apart and never changes the current sleep state.
 // Note: the thesis text specifies 50 m; this build uses 10 m as requested.
+// v2.x.8.0: PROX_THRESHOLD_M is the default; developer tools can set
+// 5 m (NEAR), 10 m (CLOSE) or 50 m (FAR) in proxThresholdM.
 #define PROX_THRESHOLD_M           10.0f
+float proxThresholdM = PROX_THRESHOLD_M;
 #define PROX_ENTRY_CONFIRM_MS      5000UL
 #define PROX_EXIT_OUT_OF_RANGE_MS  5000UL
 // Checked every second (the GPS updates once per second).
@@ -637,6 +642,7 @@ String peerRowText(int deviceId);
 void loadDistanceCalibration();
 void loadDeveloperSettings();
 void runDeveloperScreen();
+void runSleepMenu();
 bool sleepReportSlotReady();
 void saveDistanceCalibration();
 void runDistanceCalibration();
@@ -2613,7 +2619,7 @@ ProximityReading evaluateGroupProximity(int &offlineDevice, float distances[3]) 
     offlineDevice = peers[offline[0] ? 0 : 1];
     if (!fresh[k]) return PROX_READING_UNKNOWN;
     distances[k] = peerDisplayDistance(peers[k]);
-    if (distances[k] >= PROX_THRESHOLD_M) {
+    if (distances[k] >= proxThresholdM) {
       proxOwnGeometryReading = PROX_READING_OUT_OF_RANGE;
       return PROX_READING_OUT_OF_RANGE;
     }
@@ -2627,9 +2633,9 @@ ProximityReading evaluateGroupProximity(int &offlineDevice, float distances[3]) 
   distances[0] = peerDisplayDistance(peers[0]);
   distances[1] = peerDisplayDistance(peers[1]);
   distances[2] = peerPairDisplayDistance(peers[0], peers[1]);
-  bool together = distances[0] < PROX_THRESHOLD_M &&
-                  distances[1] < PROX_THRESHOLD_M &&
-                  distances[2] < PROX_THRESHOLD_M;
+  bool together = distances[0] < proxThresholdM &&
+                  distances[1] < proxThresholdM &&
+                  distances[2] < proxThresholdM;
   proxOwnGeometryReading = together ? PROX_READING_IN_RANGE : PROX_READING_OUT_OF_RANGE;
   if (!together) return PROX_READING_OUT_OF_RANGE;
   // Together by this device's measurement; the others must agree.
@@ -3073,9 +3079,9 @@ void updateMainMenuDynamic(bool force) {
     lastMainPing = showPing;
   }
 
-  String sleepText = sleepMode ? "SLEEP MODE IS ENABLED!"
-                   : (proxSleepActive ? "AUTO SLEEP: GROUP IS NEARBY"
-                   : (!proxSleepEnabled ? "AUTO SLEEP OFF (DEVELOPER)" : ""));
+  // Only manual sleep is announced here; auto sleep is shown in the sleep
+  // menu (and by the ASLEEP status in aqua).
+  String sleepText = sleepMode ? "SLEEP MODE IS ENABLED!" : "";
   if (force || sleepText != lastMainSleepMessage) {
     drawSleepModeArea(sleepText);
     lastMainSleepMessage = sleepText;
@@ -3573,27 +3579,75 @@ float bearingToPeer(double peerLat, double peerLon) {
 // Peer Location gets a larger square hitbox around the visible arrow.
 // =====================================================
 
+// Main-menu hold-to-access message under the device status row, e.g.
+// "Accessing Packet Testing..." (one dot per second held). Empty clears it.
+void drawHoldMessage(const String &message) {
+  if (currentScreen != MAIN_MENU) return;
+  tft.fillRect(0, 295, SCREEN_W, 12, BLACK);
+  if (message.length()) drawCenteredText(message, 297, YELLOW, BLACK, 1);
+}
+
+#define HOLD_ACCESS_MS 5000UL   // hold to open packet testing / developer tools
+#define HOLD_DOT_MS    1000UL   // one dot per second; a shorter tap is a tap
+
 void processTouch() {
   static bool wasTouched = false;
   static unsigned long lastAcceptedTouch = 0;
   static unsigned long compassHoldStart = 0;
   static unsigned long distanceHoldStart = 0;
-  static unsigned long titleHoldStart = 0;
+  // Main menu: CHECK LOCATION held -> packet test; TIME held -> developer.
+  static unsigned long checkHoldStart = 0;
+  static unsigned long timeHoldStart = 0;
+  static int holdDotsShown = 0;
   bool nowTouched = touch.touched();
 
   if (!nowTouched) {
+    // Released: a short tap on CHECK LOCATION opens the location screen;
+    // letting go during a hold cancels it.
+    if (wasTouched && currentScreen == MAIN_MENU) {
+      if (checkHoldStart && millis() - checkHoldStart < HOLD_DOT_MS) {
+        Serial.println("BUTTON: CHECK LOCATION");
+        checkHoldStart = 0;
+        holdDotsShown = 0;
+        drawPeerLocation();
+      } else if (holdDotsShown) {
+        drawHoldMessage("");
+      }
+    }
     wasTouched = false;
     compassHoldStart = 0;
     distanceHoldStart = 0;
-    titleHoldStart = 0;
+    checkHoldStart = 0;
+    timeHoldStart = 0;
+    holdDotsShown = 0;
     return;
   }
   if (wasTouched) {
-    // Holding the title on the main menu for 3 s opens the developer screen.
-    if (titleHoldStart && millis() - titleHoldStart >= 3000UL) {
-      titleHoldStart = 0;
-      runDeveloperScreen();
-      drawMainMenu();
+    // Hold-to-access on the main menu, with a dot for every second held.
+    if ((checkHoldStart || timeHoldStart) && currentScreen == MAIN_MENU) {
+      bool packetTest = checkHoldStart != 0;
+      unsigned long held = millis() - (packetTest ? checkHoldStart : timeHoldStart);
+      int dots = (int)min(held / HOLD_DOT_MS, HOLD_ACCESS_MS / HOLD_DOT_MS);
+      if (dots >= 1 && dots != holdDotsShown) {
+        holdDotsShown = dots;
+        String message = packetTest ? "Accessing Packet Testing" : "Accessing Developer Tools";
+        for (int i = 0; i < dots; ++i) message += ".";
+        drawHoldMessage(message);
+      }
+      if (held >= HOLD_ACCESS_MS) {
+        checkHoldStart = 0;
+        timeHoldStart = 0;
+        holdDotsShown = 0;
+        drawHoldMessage("");
+        if (packetTest) {
+          Serial.println("HOLD: PACKET TEST");
+          runPacketTest();
+        } else {
+          Serial.println("HOLD: DEVELOPER TOOLS");
+          runDeveloperScreen();
+        }
+        drawMainMenu();
+      }
     }
     // Holding the compass circle for 3 s starts compass calibration.
     if (compassHoldStart && millis() - compassHoldStart >= 3000UL) {
@@ -3635,41 +3689,27 @@ void processTouch() {
                 p.x, p.y, screenX, screenY);
 
   if (currentScreen == MAIN_MENU) {
-    // Title bar "LORA THE EXPLORER": hold 3 s for the developer screen.
-    if (screenY < 56) {
-      titleHoldStart = millis();
-      return;
-    }
-
-    // Double-tap the TIME/DATE area to run the packet test.
-    static unsigned long lastTimeTap = 0;
+    // TIME/DATE area: hold 5 s for the developer tools.
     if (screenX >= 20 && screenX < 220 &&
         screenY >= 56 && screenY < 104) {
-      if (lastTimeTap && millis() - lastTimeTap <= 500UL) {
-        lastTimeTap = 0;
-        Serial.println("BUTTON: PACKET TEST (DOUBLE TAP TIME)");
-        runPacketTest();
-        drawMainMenu();
-      } else {
-        lastTimeTap = millis();
-      }
+      timeHoldStart = millis();
       return;
     }
 
-    // EXACT white rectangle: CHECK LOCATION
+    // EXACT white rectangle: CHECK LOCATION. A tap opens it (on release);
+    // holding it 5 s runs the packet test instead.
     if (screenX >= 22 && screenX < 218 &&
         screenY >= 134 && screenY < 178) {
-      Serial.println("BUTTON: CHECK LOCATION");
-      drawPeerLocation();
+      checkHoldStart = millis();
       return;
     }
 
-    // EXACT white rectangle: SLEEP MODE
+    // EXACT white rectangle: SLEEP MODE -> sleep menu.
     if (screenX >= 22 && screenX < 218 &&
         screenY >= 186 && screenY < 230) {
-      Serial.println("BUTTON: SLEEP MODE");
-      setSleepMode(!sleepMode);
-      updateMainMenuDynamic(true);
+      Serial.println("BUTTON: SLEEP MODE MENU");
+      runSleepMenu();
+      drawMainMenu();
       return;
     }
 
@@ -4177,14 +4217,22 @@ void runMagCalibration() {
 // A test packet takes ~0.25 s on air at SF10; the rest is time for the
 // receivers to read it. 20 packets take ~6.4 s.
 #define TEST_PACKET_INTERVAL 320UL
-// Developer setting "TEST PACE: SLOW": one packet every 1.15 s, the same
-// transmit pace as the v2.x.5.x test (the tester's radio then transmits
-// ~22% of the time instead of ~78%). For checking whether the fast pace
-// affects a device; 20 packets take ~23 s.
+// Developer tools "PACE": SPEEDY (above, 0.32 s), NORMAL (0.65 s, ~13 s)
+// or PRECISE (1.15 s, the v2.x.5.x pace: the tester's radio transmits ~22%
+// of the time instead of ~78%; ~23 s).
+#define TEST_PACKET_INTERVAL_NORMAL 650UL
 #define TEST_PACKET_INTERVAL_SLOW 1150UL
-bool testPaceSlow = false;
+#define PACE_SPEEDY  0
+#define PACE_NORMAL  1
+#define PACE_PRECISE 2
+int testPace = PACE_SPEEDY;
+const char *testPaceName() {
+  return testPace == PACE_SPEEDY ? "SPEEDY" : (testPace == PACE_NORMAL ? "NORMAL" : "PRECISE");
+}
 unsigned long packetTestInterval() {
-  return testPaceSlow ? TEST_PACKET_INTERVAL_SLOW : TEST_PACKET_INTERVAL;
+  if (testPace == PACE_NORMAL) return TEST_PACKET_INTERVAL_NORMAL;
+  if (testPace == PACE_PRECISE) return TEST_PACKET_INTERVAL_SLOW;
+  return TEST_PACKET_INTERVAL;
 }
 // Result answers (TS, ~0.37 s on air) go out one after the other.
 #define TEST_REPLY_SLOT 420UL
@@ -4657,10 +4705,10 @@ void runPacketTest() {
       updateGPS();
       delay(1);
     }
-    // The interval is sent along only in SLOW pace, so receivers keep the
-    // test open long enough (FAST packets are unchanged).
+    // The interval is sent along in NORMAL and PRECISE pace, so receivers
+    // keep the test open long enough (SPEEDY packets are unchanged).
     sendRawLoRa("T," + String(DEVICE_ID) + "," + String(seq) +
-                (testPaceSlow ? "," + String(interval) : String("")));
+                (testPace != PACE_SPEEDY ? "," + String(interval) : String("")));
 
     tft.fillRect(0, 80, SCREEN_W, 40, BLACK);
     drawCenteredText(String(seq + 1) + " / " + String(TEST_PACKET_COUNT), 85, GREEN, BLACK, 2);
@@ -4696,8 +4744,7 @@ void runPacketTest() {
   tft.fillScreen(BLACK);
   drawPacketTestClock(true);
   drawCenteredText("PACKET TEST RESULT", 40, WHITE, BLACK, 2);
-  drawCenteredText(testPaceSlow ? "Packets received (SLOW pace)" : "Packets received by each device",
-                   60, GRAY, BLACK, 1);
+  drawCenteredText(String("Packets received (") + testPaceName() + " pace)", 60, GRAY, BLACK, 1);
 
   int y = 72;
   bool anyAnswer = false;
@@ -4768,28 +4815,39 @@ void runPacketTest() {
 }
 
 // =====================================================
-// DEVELOPER SCREEN
-// Hold the title "LORA THE EXPLORER" on the main menu for 3 s. Turns
-// automatic proximity sleep on/off (saved in flash, per device). While it
-// is off this device reports "apart" in its heartbeats, so no device in the
-// group goes into proximity sleep - handy while testing distances.
+// SLEEP MENU, DEVELOPER TOOLS AND CREDITS (v2.x.8.0)
+// Main menu:
+//  - tap SLEEP MODE           -> sleep menu (manual sleep, auto sleep)
+//  - hold CHECK LOCATION 5 s  -> packet test   (short tap: location screen)
+//  - hold the TIME 5 s        -> developer tools (test pace, auto sleep
+//                                distance, credits)
+// Settings are saved in flash on each device.
 // =====================================================
 
 void loadDeveloperSettings() {
   Preferences prefs;
   prefs.begin("dev", true);
   proxSleepEnabled = prefs.getBool("proxOn", true);
-  testPaceSlow = prefs.getBool("slowTest", false);
+  int pace = prefs.getInt("pace", -1);
+  // Older builds saved only FAST/SLOW.
+  if (pace < PACE_SPEEDY || pace > PACE_PRECISE) {
+    pace = prefs.getBool("slowTest", false) ? PACE_PRECISE : PACE_SPEEDY;
+  }
+  testPace = pace;
+  int meters = prefs.getInt("proxM", (int)PROX_THRESHOLD_M);
+  if (meters != 5 && meters != 10 && meters != 50) meters = (int)PROX_THRESHOLD_M;
+  proxThresholdM = (float)meters;
   prefs.end();
-  Serial.printf("Developer: automatic proximity sleep %s, packet test pace %s\n",
-                proxSleepEnabled ? "ON" : "OFF", testPaceSlow ? "SLOW" : "FAST");
+  Serial.printf("Settings: auto sleep %s at %d m, packet test pace %s\n",
+                proxSleepEnabled ? "ON" : "OFF", meters, testPaceName());
 }
 
 void saveDeveloperSettings() {
   Preferences prefs;
   prefs.begin("dev", false);
   prefs.putBool("proxOn", proxSleepEnabled);
-  prefs.putBool("slowTest", testPaceSlow);
+  prefs.putInt("pace", testPace);
+  prefs.putInt("proxM", (int)proxThresholdM);
   prefs.end();
 }
 
@@ -4813,39 +4871,57 @@ bool readScreenTap(int &screenX, int &screenY) {
   return true;
 }
 
-void drawDeveloperToggle() {
-  tft.fillRect(22, 70, 196, 40, proxSleepEnabled ? GREEN : GRAY);
-  drawCenteredText(proxSleepEnabled ? "AUTO SLEEP: ON" : "AUTO SLEEP: OFF", 83, BLACK,
-                   proxSleepEnabled ? GREEN : GRAY, 2);
-  tft.fillRect(0, 114, SCREEN_W, 12, BLACK);
-  drawCenteredText(proxSleepEnabled ? "Group sleeps when all are < 10 m"
-                                    : "Off: the whole group stays awake",
-                   116, WHITE, BLACK, 1);
+// A full-width button: filled rectangle with centred size-2 text.
+void drawMenuButton(int y, int h, uint16_t fill, uint16_t textColor, const String &label) {
+  tft.fillRect(22, y, 196, h, fill);
+  drawCenteredText(label, y + (h - 16) / 2, textColor, fill, 2);
 }
 
-void drawDeveloperPaceToggle() {
-  tft.fillRect(22, 155, 196, 40, testPaceSlow ? YELLOW : GREEN);
-  drawCenteredText(testPaceSlow ? "TEST PACE: SLOW" : "TEST PACE: FAST", 168, BLACK,
-                   testPaceSlow ? YELLOW : GREEN, 2);
-  tft.fillRect(0, 199, SCREEN_W, 12, BLACK);
-  drawCenteredText(testPaceSlow ? "1 packet / 1.15 s (about 23 s)"
-                                : "1 packet / 0.32 s (about 8 s)",
-                   201, WHITE, BLACK, 1);
+bool menuButtonHit(int x, int y, int top, int h) {
+  return x >= 22 && x < 218 && y >= top && y < top + h;
 }
 
-void runDeveloperScreen() {
-  Serial.println("DEVELOPER SCREEN");
+// ---------------- Sleep menu ----------------
+
+void drawSleepMenu() {
   tft.fillScreen(BLACK);
-  drawCenteredText("DEVELOPER", 30, YELLOW, BLACK, 2);
-  drawCenteredText("Proximity sleep (10 m)", 56, WHITE, BLACK, 1);
-  drawDeveloperToggle();
-  drawCenteredText("Packet test pace (this device)", 141, WHITE, BLACK, 1);
-  drawDeveloperPaceToggle();
-  drawCenteredText("(settings saved on this device)", 222, GRAY, BLACK, 1);
-  tft.fillRect(22, 240, 196, 48, WHITE);
-  drawCenteredText("BACK", 257, BLACK, WHITE, 2);
+  drawCenteredText("SLEEP MODE", 30, WHITE, BLACK, 2);
 
-  // Wait for the finger from the 3 s hold to lift first.
+  // Manual sleep.
+  drawMenuButton(54, 36, sleepMode ? YELLOW : GRAY, BLACK,
+                 sleepMode ? "SLEEP: ON" : "SLEEP: OFF");
+  drawCenteredText(sleepMode ? "Radio off; location sent every 5 min"
+                             : "Turn on to save power right now",
+                   96, WHITE, BLACK, 1);
+  drawCenteredText("Others see this device as ASLEEP", 107, GRAY, BLACK, 1);
+
+  // Automatic (GPS proximity) sleep.
+  drawMenuButton(128, 36, proxSleepEnabled ? AQUA : GRAY, BLACK,
+                 proxSleepEnabled ? "AUTO SLEEP: ON" : "AUTO SLEEP: OFF");
+  drawCenteredText("Sleeps by itself when all devices", 170, WHITE, BLACK, 1);
+  drawCenteredText("are within " + String((int)proxThresholdM) + " m of each other (GPS)",
+                   181, WHITE, BLACK, 1);
+  drawCenteredText("ALL devices must turn this ON", 194, YELLOW, BLACK, 1);
+  String now;
+  uint16_t nowColor = LIGHTGREEN;
+  if (!proxSleepEnabled) {
+    now = "Now: off on this device";
+    nowColor = GRAY;
+  } else if (proxSleepActive) {
+    now = "Now: group nearby - auto sleeping";
+    nowColor = AQUA;
+  } else {
+    now = "Now: awake, waiting for the group";
+  }
+  drawCenteredText(now, 210, nowColor, BLACK, 1);
+
+  drawMenuButton(244, 44, WHITE, BLACK, "BACK");
+}
+
+void runSleepMenu() {
+  Serial.println("SLEEP MENU");
+  drawSleepMenu();
+  // Let the finger that opened the menu lift first.
   while (touch.touched()) { serviceRadio(); delay(5); }
 
   unsigned long lastActivity = millis();
@@ -4854,17 +4930,118 @@ void runDeveloperScreen() {
     int x, y;
     if (readScreenTap(x, y)) {
       lastActivity = millis();
-      if (x >= 22 && x < 218 && y >= 70 && y < 110) {
+      if (menuButtonHit(x, y, 54, 36)) {
+        Serial.println("BUTTON: SLEEP MODE TOGGLE");
+        setSleepMode(!sleepMode);
+        drawSleepMenu();
+      } else if (menuButtonHit(x, y, 128, 36)) {
         proxSleepEnabled = !proxSleepEnabled;
         saveDeveloperSettings();
-        Serial.printf("Developer: automatic proximity sleep %s\n", proxSleepEnabled ? "ON" : "OFF");
-        drawDeveloperToggle();
-      } else if (x >= 22 && x < 218 && y >= 155 && y < 195) {
-        testPaceSlow = !testPaceSlow;
+        Serial.printf("Auto sleep %s\n", proxSleepEnabled ? "ON" : "OFF");
+        drawSleepMenu();
+      } else if (menuButtonHit(x, y, 244, 44)) {
+        break;
+      }
+    }
+    delay(5);
+  }
+}
+
+// ---------------- Developer tools ----------------
+
+void drawDeveloperPaceToggle() {
+  uint16_t fill = testPace == PACE_SPEEDY ? GREEN : (testPace == PACE_NORMAL ? WHITE : YELLOW);
+  drawMenuButton(60, 34, fill, BLACK, String("PACE: ") + testPaceName());
+  tft.fillRect(0, 97, SCREEN_W, 22, BLACK);
+  if (testPace == PACE_SPEEDY) {
+    drawCenteredText("1 packet / 0.32 s - test about 8 s", 99, WHITE, BLACK, 1);
+    drawCenteredText("Fastest; heaviest radio use", 110, GRAY, BLACK, 1);
+  } else if (testPace == PACE_NORMAL) {
+    drawCenteredText("1 packet / 0.65 s - test about 15 s", 99, WHITE, BLACK, 1);
+    drawCenteredText("Balanced speed and radio load", 110, GRAY, BLACK, 1);
+  } else {
+    drawCenteredText("1 packet / 1.15 s - test about 25 s", 99, WHITE, BLACK, 1);
+    drawCenteredText("Slowest; gentlest on the radio", 110, GRAY, BLACK, 1);
+  }
+}
+
+void drawDeveloperDistanceToggle() {
+  int m = (int)proxThresholdM;
+  uint16_t fill = m == 5 ? GREEN : (m == 10 ? WHITE : YELLOW);
+  String label = m == 5 ? "NEAR: 5 m" : (m == 10 ? "CLOSE: 10 m" : "FAR: 50 m");
+  drawMenuButton(138, 34, fill, BLACK, label);
+  tft.fillRect(0, 175, SCREEN_W, 22, BLACK);
+  drawCenteredText("Auto sleep when all are within " + String(m) + " m", 177, WHITE, BLACK, 1);
+  drawCenteredText("Set the same on all devices", 188, YELLOW, BLACK, 1);
+}
+
+void drawDeveloperMenu() {
+  tft.fillScreen(BLACK);
+  drawCenteredText("DEVELOPER", 30, YELLOW, BLACK, 2);
+  drawCenteredText("Packet test pace", 50, WHITE, BLACK, 1);
+  drawDeveloperPaceToggle();
+  drawCenteredText("Auto sleep distance", 128, WHITE, BLACK, 1);
+  drawDeveloperDistanceToggle();
+  drawMenuButton(202, 32, DARKGRAY, WHITE, "CREDITS");
+  drawMenuButton(244, 44, WHITE, BLACK, "BACK");
+}
+
+void runCreditsScreen() {
+  tft.fillScreen(BLACK);
+  drawCenteredText("Lora the Explorer:", 30, YELLOW, BLACK, 2);
+  drawCenteredText("A Decentralized Offline LoRa-Based", 52, WHITE, BLACK, 1);
+  drawCenteredText("Wearable Communication and Tracking", 63, WHITE, BLACK, 1);
+  drawCenteredText("System for Dead Zone Environments", 74, WHITE, BLACK, 1);
+  drawCenteredText("By", 92, GRAY, BLACK, 1);
+  drawCenteredText("HILARIO, STEFFI ANNE M.", 106, WHITE, BLACK, 1);
+  drawCenteredText("PANEDA, CHRISTIAN ARON R.", 117, WHITE, BLACK, 1);
+  drawCenteredText("RIVERA, PAULEEN ANN C.", 128, WHITE, BLACK, 1);
+  drawCenteredText("TABELISMA, SEAN MARTIN ANDREI V.", 139, WHITE, BLACK, 1);
+  drawCenteredText("Submitted in Partial Fulfillment of", 158, GRAY, BLACK, 1);
+  drawCenteredText("the Requirements for the Degree of", 169, GRAY, BLACK, 1);
+  drawCenteredText("Bachelor of Science in Computer", 180, GRAY, BLACK, 1);
+  drawCenteredText("Engineering at", 191, GRAY, BLACK, 1);
+  drawCenteredText("FEU Institute of Technology.", 205, LIGHTGREEN, BLACK, 1);
+  drawCenteredText(String("Version: ") + FIRMWARE_VERSION, 228, YELLOW, BLACK, 1);
+  drawCenteredText("Tap anywhere to go back", 300, GRAY, BLACK, 1);
+
+  while (touch.touched()) { serviceRadio(); delay(5); }
+  unsigned long shownAt = millis();
+  int x, y;
+  while (millis() - shownAt < 60000UL) {
+    serviceRadio();
+    if (readScreenTap(x, y)) break;
+    delay(5);
+  }
+}
+
+void runDeveloperScreen() {
+  Serial.println("DEVELOPER TOOLS");
+  drawDeveloperMenu();
+  // Let the finger from the 5 s hold lift first.
+  while (touch.touched()) { serviceRadio(); delay(5); }
+
+  unsigned long lastActivity = millis();
+  while (millis() - lastActivity < 30000UL) {
+    serviceRadio();
+    int x, y;
+    if (readScreenTap(x, y)) {
+      lastActivity = millis();
+      if (menuButtonHit(x, y, 60, 34)) {
+        testPace = (testPace + 1) % 3;
         saveDeveloperSettings();
-        Serial.printf("Developer: packet test pace %s\n", testPaceSlow ? "SLOW" : "FAST");
+        Serial.printf("Developer: packet test pace %s\n", testPaceName());
         drawDeveloperPaceToggle();
-      } else if (x >= 22 && x < 218 && y >= 240 && y < 288) {
+      } else if (menuButtonHit(x, y, 138, 34)) {
+        int m = (int)proxThresholdM;
+        proxThresholdM = m == 5 ? 10.0f : (m == 10 ? 50.0f : 5.0f);
+        saveDeveloperSettings();
+        Serial.printf("Developer: auto sleep distance %d m\n", (int)proxThresholdM);
+        drawDeveloperDistanceToggle();
+      } else if (menuButtonHit(x, y, 202, 32)) {
+        runCreditsScreen();
+        drawDeveloperMenu();
+      } else if (menuButtonHit(x, y, 244, 44)) {
         break;
       }
     }
