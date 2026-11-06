@@ -1,6 +1,6 @@
-// Current Version: v2.3.8.0
-// Added a sleep menu, hold-to-open packet testing and developer tools with pace, auto sleep distance and credits screens.
-// SLEEP MODE opens a menu with the manual sleep toggle and the auto sleep (GPS) toggle, each explained; the main menu shows only manual sleep; holding CHECK LOCATION 5 s runs the packet test and holding the time 5 s opens developer tools, with "Accessing ..." and a dot per second under the device status (title hold and time double-tap removed); developer tools: test pace SPEEDY 0.32 s / NORMAL 0.65 s / PRECISE 1.15 s, auto sleep distance NEAR 5 m / CLOSE 10 m (default) / FAR 50 m, and a credits screen with the version.
+// Current Version: v2.3.8.1
+// Added the Lora the Explorer logo to the credits screen.
+// The credits screen draws the 72x72 compass-and-mountain logo (run-length encoded, 7 colours, about 1 KB of flash) centred at the top, below the area hidden by the enclosure, and moves the credits text down to fit; no other screen or function changed.
 
 #include <Arduino.h>
 #include <SPI.h>
@@ -22,7 +22,7 @@ void loop();
 
 #define DEVICE_ID 3
 // Shown on the developer tools' CREDITS screen.
-#define FIRMWARE_VERSION "v2.3.8.0"
+#define FIRMWARE_VERSION "v2.3.8.1"
 
 // =====================================================
 // TFT SPI
@@ -4986,23 +4986,83 @@ void drawDeveloperMenu() {
   drawMenuButton(244, 44, WHITE, BLACK, "BACK");
 }
 
+// ---------- Credits logo ----------
+// 72x72 Lora the Explorer logo, run-length encoded as (colour index, run length) pairs,
+// row by row. Colour 0 is the black background and is not drawn.
+#define CREDITS_LOGO_W 72
+#define CREDITS_LOGO_H 72
+const uint16_t CREDITS_LOGO_PALETTE[7] = {
+  0x0000,  // 0 background (skipped)
+  0x320D,  // 1 navy circle
+  0x8665,  // 2 compass ring green
+  0xFFFF,  // 3 white mountains
+  0xE000,  // 4 red star
+  0x0F40,  // 5 green star
+  0x001F   // 6 blue star
+};
+const uint8_t CREDITS_LOGO_RLE[] PROGMEM = {
+  0,72,0,72,0,35,2,1,0,36,0,35,2,1,0,36,0,35,2,1,0,36,0,35,2,1,0,36,0,35,2,1,
+  0,36,0,34,2,2,0,36,0,34,2,2,0,36,0,34,2,2,0,36,0,34,2,2,0,36,0,33,2,3,0,36,
+  0,33,2,3,0,36,0,30,2,6,0,3,2,3,0,30,0,27,2,9,0,3,2,6,0,27,0,25,2,6,0,10,
+  2,6,0,25,0,16,2,1,0,6,2,5,0,16,2,5,0,5,2,2,0,16,0,16,2,2,0,4,2,4,0,20,
+  2,4,0,3,2,2,0,17,0,17,2,2,0,2,2,3,0,9,1,7,0,8,2,6,0,18,0,18,2,2,0,2,
+  2,1,0,7,1,13,0,6,2,4,0,19,0,18,2,3,0,7,1,17,0,5,2,2,0,20,0,18,2,3,0,5,
+  1,21,0,6,2,1,0,18,0,17,2,3,0,5,1,23,0,4,2,3,0,17,0,16,2,3,0,5,1,13,5,1,
+  1,11,0,4,2,3,0,16,0,16,2,2,0,5,1,13,5,3,1,11,0,4,2,2,0,16,0,15,2,3,0,4,
+  1,14,5,3,1,12,0,3,2,3,0,15,0,15,2,2,0,4,1,16,5,1,1,13,0,4,2,2,0,15,0,14,
+  2,3,0,4,1,31,0,3,2,3,0,14,0,14,2,2,0,4,1,33,0,3,2,2,0,14,0,14,2,2,0,4,
+  1,9,4,1,1,8,3,1,1,6,6,1,1,7,0,3,2,2,0,14,0,13,2,3,0,3,1,10,4,1,1,7,
+  3,3,1,5,6,1,1,7,0,3,2,3,0,13,0,13,2,2,0,4,1,9,4,3,1,5,3,5,1,3,6,4,
+  1,6,0,3,2,2,0,13,0,13,2,2,0,4,1,9,4,3,1,4,3,2,1,1,3,4,1,2,6,3,1,7,
+  0,3,2,2,0,13,0,19,1,10,4,1,1,4,3,2,1,2,3,5,1,2,6,1,1,8,0,3,2,4,0,11,
+  0,19,1,14,3,2,1,2,3,7,1,10,0,3,2,8,0,7,0,19,1,7,3,1,1,5,3,2,1,3,3,7,
+  1,10,0,3,2,13,0,2,0,2,2,13,0,4,1,6,3,3,1,3,3,2,1,3,3,9,1,2,3,2,1,5,
+  0,18,0,6,2,9,0,4,1,5,3,5,1,1,3,2,1,4,3,1,1,3,3,9,1,5,0,18,0,11,2,4,
+  0,4,1,4,3,2,1,1,3,5,1,8,3,11,1,4,0,18,0,13,2,2,0,4,1,3,3,2,1,2,3,4,
+  1,9,3,12,1,3,0,3,2,2,0,13,0,13,2,2,0,4,1,2,3,2,1,4,3,2,1,10,3,6,1,1,
+  3,6,1,2,0,3,2,2,0,13,0,13,2,3,0,3,1,1,3,1,1,5,3,1,1,13,3,4,1,5,3,4,
+  0,3,2,3,0,13,0,14,2,2,0,4,1,5,3,1,1,14,3,3,1,6,0,7,2,2,0,14,0,14,2,2,
+  0,3,1,5,3,1,1,15,3,2,1,7,0,7,2,2,0,14,0,14,2,3,0,1,1,34,0,3,2,3,0,14,
+  0,15,2,2,0,4,1,31,0,3,2,2,0,15,0,15,2,3,0,4,1,29,0,3,2,3,0,15,0,16,2,2,
+  0,5,1,27,0,4,2,2,0,16,0,16,2,3,0,5,1,25,0,4,2,3,0,16,0,17,2,3,0,5,1,23,
+  0,4,2,3,0,17,0,18,2,1,0,7,1,21,0,4,2,3,0,18,0,21,2,1,0,5,1,18,0,6,2,3,
+  0,18,0,20,2,3,0,7,1,13,0,6,2,1,0,2,2,2,0,18,0,19,2,5,0,9,1,7,0,8,2,3,
+  0,2,2,2,0,17,0,18,2,1,0,3,2,4,0,20,2,4,0,4,2,2,0,16,0,17,2,1,0,5,2,5,
+  0,16,2,5,0,6,2,1,0,16,0,25,2,6,0,10,2,6,0,25,0,27,2,6,0,3,2,9,0,27,0,29,
+  2,4,0,3,2,7,0,29,0,36,2,3,0,33,0,36,2,3,0,33,0,36,2,2,0,34,0,36,2,2,0,34,
+  0,36,2,2,0,34,0,36,2,2,0,34,0,36,2,2,0,34,0,36,2,1,0,35,0,36,2,1,0,35,0,36,
+  2,1,0,35,0,36,2,1,0,35,0,72,0,72
+};
+
+void drawCreditsLogo(int x0, int y0) {
+  int x = 0, y = 0;
+  for (size_t i = 0; i + 1 < sizeof(CREDITS_LOGO_RLE) && y < CREDITS_LOGO_H; i += 2) {
+    uint8_t c = pgm_read_byte(&CREDITS_LOGO_RLE[i]);
+    uint8_t n = pgm_read_byte(&CREDITS_LOGO_RLE[i + 1]);
+    if (c != 0 && c < 7) tft.fillRect(x0 + x, y0 + y, n, 1, CREDITS_LOGO_PALETTE[c]);
+    x += n;
+    if (x >= CREDITS_LOGO_W) { x = 0; y++; }
+  }
+}
+
 void runCreditsScreen() {
   tft.fillScreen(BLACK);
-  drawCenteredText("Lora the Explorer:", 30, YELLOW, BLACK, 2);
-  drawCenteredText("A Decentralized Offline LoRa-Based", 52, WHITE, BLACK, 1);
-  drawCenteredText("Wearable Communication and Tracking", 63, WHITE, BLACK, 1);
-  drawCenteredText("System for Dead Zone Environments", 74, WHITE, BLACK, 1);
-  drawCenteredText("By", 92, GRAY, BLACK, 1);
-  drawCenteredText("HILARIO, STEFFI ANNE M.", 106, WHITE, BLACK, 1);
-  drawCenteredText("PANEDA, CHRISTIAN ARON R.", 117, WHITE, BLACK, 1);
-  drawCenteredText("RIVERA, PAULEEN ANN C.", 128, WHITE, BLACK, 1);
-  drawCenteredText("TABELISMA, SEAN MARTIN ANDREI V.", 139, WHITE, BLACK, 1);
-  drawCenteredText("Submitted in Partial Fulfillment of", 158, GRAY, BLACK, 1);
-  drawCenteredText("the Requirements for the Degree of", 169, GRAY, BLACK, 1);
-  drawCenteredText("Bachelor of Science in Computer", 180, GRAY, BLACK, 1);
-  drawCenteredText("Engineering at", 191, GRAY, BLACK, 1);
-  drawCenteredText("FEU Institute of Technology.", 205, LIGHTGREEN, BLACK, 1);
-  drawCenteredText(String("Version: ") + FIRMWARE_VERSION, 228, YELLOW, BLACK, 1);
+  drawCreditsLogo((240 - CREDITS_LOGO_W) / 2, 28);
+  drawCenteredText("Lora the Explorer:", 106, YELLOW, BLACK, 2);
+  drawCenteredText("A Decentralized Offline LoRa-Based", 126, WHITE, BLACK, 1);
+  drawCenteredText("Wearable Communication and Tracking", 137, WHITE, BLACK, 1);
+  drawCenteredText("System for Dead Zone Environments", 148, WHITE, BLACK, 1);
+  drawCenteredText("By", 162, GRAY, BLACK, 1);
+  drawCenteredText("HILARIO, STEFFI ANNE M.", 174, WHITE, BLACK, 1);
+  drawCenteredText("PANEDA, CHRISTIAN ARON R.", 185, WHITE, BLACK, 1);
+  drawCenteredText("RIVERA, PAULEEN ANN C.", 196, WHITE, BLACK, 1);
+  drawCenteredText("TABELISMA, SEAN MARTIN ANDREI V.", 207, WHITE, BLACK, 1);
+  drawCenteredText("Submitted in Partial Fulfillment of", 221, GRAY, BLACK, 1);
+  drawCenteredText("the Requirements for the Degree of", 232, GRAY, BLACK, 1);
+  drawCenteredText("Bachelor of Science in Computer", 243, GRAY, BLACK, 1);
+  drawCenteredText("Engineering at", 254, GRAY, BLACK, 1);
+  drawCenteredText("FEU Institute of Technology.", 267, LIGHTGREEN, BLACK, 1);
+  drawCenteredText(String("Version: ") + FIRMWARE_VERSION, 281, YELLOW, BLACK, 1);
   drawCenteredText("Tap anywhere to go back", 300, GRAY, BLACK, 1);
 
   while (touch.touched()) { serviceRadio(); delay(5); }
