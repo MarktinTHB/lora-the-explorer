@@ -1,6 +1,6 @@
-// Current Version: v2.1.6.1
-// Added a packet test pace setting (FAST / SLOW) on the developer screen to check whether the fast test pace causes the low LORA #1 -> LORA #3 results.
-// TEST PACE: SLOW sends one test packet every 1.15 s (the v2.x.5.x transmit pace) and tells receivers the interval in the test packet; FAST stays at 0.32 s with unchanged packets; receivers end the test from that interval and release it as soon as the result request arrives; the pace is shown on the result screen and in the serial log. Radio settings unchanged.
+// Current Version: v2.1.6.2
+// Fixed screen content hidden behind the enclosure's top edge: every screen now fits below it, with a cleaner, more compact main menu.
+// Layout only (no behaviour changes): main menu reflowed below y=28 (title, time, date, messages, buttons 44 px tall, device status) with thin gray dividers; CHECK LOCATION header, back arrow and radar moved down 23 px (radar size/scale unchanged); packet test and developer screen titles and the top touch-calibration crosses moved below the edge; tap areas moved with their buttons.
 
 #include <Arduino.h>
 #include <SPI.h>
@@ -314,7 +314,10 @@ unsigned long statusTimeoutHoldUntil = 0;
 #define SLEEP_DEVICE_TIMEOUT 720000UL
 #define ONLINE_CONFIRM_PACKETS 2
 #define PEER_CIRCLE_CENTER_X 120
-#define PEER_CIRCLE_CENTER_Y 124
+// v2.x.6.2: the enclosure window hides the top ~24 px of the display, so
+// every screen keeps its content below y = 28. The radar moved down 23 px
+// with it (its size and scale are unchanged).
+#define PEER_CIRCLE_CENTER_Y 147
 // Reduced from 80 so the rotating N/E/S/W letters (kept on the same 93 px
 // orbit, see PEER_CARDINAL_ORBIT) never touch the circle outline.
 #define PEER_CIRCLE_RADIUS 76
@@ -2924,49 +2927,55 @@ void drawMainMenu() {
   currentScreen = MAIN_MENU;
   tft.fillScreen(BLACK);
 
+  // Layout (v2.x.6.2) keeps everything below the enclosure's top edge:
+  // title 32, time 62, date 93, messages 107/119, buttons 134-178 and
+  // 186-230, device status 249-289; thin gray lines separate the sections.
   tft.setTextSize(2);
   tft.setTextColor(WHITE, BLACK);
-  tft.setCursor(19, 11);
+  tft.setCursor(19, 32);
   tft.print("LORA THE EXPLORER");
+  tft.drawFastHLine(22, 54, 196, DARKGRAY);
 
   // Static white action rectangles.
-  tft.fillRect(22, 136, 196, 48, WHITE);
+  tft.fillRect(22, 134, 196, 44, WHITE);
   tft.setTextColor(BLACK, WHITE);
   tft.setTextSize(2);
-  tft.setCursor(37, 153);
+  tft.setCursor(37, 148);
   tft.print("CHECK LOCATION");
 
-  tft.fillRect(22, 191, 196, 48, WHITE);
-  tft.setCursor(60, 206);
+  tft.fillRect(22, 186, 196, 44, WHITE);
+  tft.setCursor(60, 200);
   tft.print("SLEEP MODE");
+
+  tft.drawFastHLine(22, 240, 196, DARKGRAY);
 
   // Status icons keep device identity colors at all times.
   // ONLINE/OFFLINE is shown only by the text.
   for (int i = 1; i <= 3; i++) {
     int iconX = (i == 1) ? 34 : (i == 2 ? 114 : 191);
     int textX = (i == 1) ? 23 : (i == 2 ? 103 : 178);
-    tft.drawBitmap(iconX, 258, image_activeDev3_bits, 13, 13,
+    tft.drawBitmap(iconX, 249, image_activeDev3_bits, 13, 13,
                    deviceColor(i));
     tft.setTextSize(1);
     if (!remote[i].online) {
       tft.setTextColor(GRAY, BLACK);
-      tft.setCursor(textX, 280);
+      tft.setCursor(textX, 268);
       tft.print("OFFLINE");
     } else if (remote[i].asleep) {
       tft.setTextColor(remote[i].proximitySleep ? AQUA : YELLOW, BLACK);
-      tft.setCursor(textX, 280);
+      tft.setCursor(textX, 268);
       tft.print("ASLEEP");
     } else {
       tft.setTextColor(GREEN, BLACK);
-      tft.setCursor(textX, 280);
+      tft.setCursor(textX, 268);
       tft.print("ONLINE");
     }
   }
 
   tft.setTextColor(WHITE, BLACK);
-  tft.setCursor(20, 295);  tft.print("LORA #1");
-  tft.setCursor(100, 295); tft.print("LORA #2");
-  tft.setCursor(177, 295); tft.print("LORA #3");
+  tft.setCursor(20, 282);  tft.print("LORA #1");
+  tft.setCursor(100, 282); tft.print("LORA #2");
+  tft.setCursor(177, 282); tft.print("LORA #3");
 
   lastMainTime = "";
   lastMainDate = "";
@@ -2981,31 +2990,31 @@ void drawMainMenu() {
 }
 
 void drawPingArea(const String &message) {
-  tft.fillRect(0, 100, 240, 22, BLACK);
+  tft.fillRect(0, 104, 240, 13, BLACK);
   if (message.length()) {
     tft.setTextSize(1);
     tft.setTextColor(LIGHTGREEN, BLACK);
     int16_t x1, y1;
     uint16_t w, h;
-    tft.getTextBounds(message.c_str(), 0, 112, &x1, &y1, &w, &h);
+    tft.getTextBounds(message.c_str(), 0, 107, &x1, &y1, &w, &h);
     int x = (SCREEN_W - (int)w) / 2;
     if (x < 0) x = 0;
-    tft.setCursor(x, 112);
+    tft.setCursor(x, 107);
     tft.print(message);
   }
 }
 
 void drawSleepModeArea(const String &message) {
-  tft.fillRect(0, 122, 240, 13, BLACK);
+  tft.fillRect(0, 117, 240, 12, BLACK);
   if (message.length()) {
     tft.setTextSize(1);
     tft.setTextColor(LIGHTGREEN, BLACK);
     int16_t x1, y1;
     uint16_t w, h;
-    tft.getTextBounds(message.c_str(), 0, 124, &x1, &y1, &w, &h);
+    tft.getTextBounds(message.c_str(), 0, 119, &x1, &y1, &w, &h);
     int x = (SCREEN_W - (int)w) / 2;
     if (x < 0) x = 0;
-    tft.setCursor(x, 124);
+    tft.setCursor(x, 119);
     tft.print(message);
   }
 }
@@ -3025,8 +3034,8 @@ void updateMainMenuDynamic(bool force) {
 
   String timeText = timeBuf;
   if (force || timeText != lastMainTime) {
-    tft.fillRect(25, 43, 190, 31, BLACK);
-    drawCenteredText(timeText, 49, YELLOW, BLACK, 3);
+    tft.fillRect(25, 58, 190, 31, BLACK);
+    drawCenteredText(timeText, 62, YELLOW, BLACK, 3);
     lastMainTime = timeText;
   }
 
@@ -3044,9 +3053,9 @@ void updateMainMenuDynamic(bool force) {
   }
 
   if (force || dateText != lastMainDate) {
-    tft.fillRect(35, 84, 170, 20, BLACK);
+    tft.fillRect(35, 90, 170, 13, BLACK);
     if (dateText.length()) {
-      drawCenteredText(dateText, 89, YELLOW, BLACK, 1);
+      drawCenteredText(dateText, 93, YELLOW, BLACK, 1);
     }
     lastMainDate = dateText;
   }
@@ -3082,25 +3091,25 @@ void updateMainMenuDynamic(bool force) {
       int textX = (i == 1) ? 23 : (i == 2 ? 103 : 178);
 
       // Identity circles never change color. They are the legend.
-      tft.fillRect(iconX - 2, 255, 18, 18, BLACK);
-      tft.drawBitmap(iconX, 258, image_activeDev3_bits, 13, 13,
+      tft.fillRect(iconX - 2, 246, 18, 18, BLACK);
+      tft.drawBitmap(iconX, 249, image_activeDev3_bits, 13, 13,
                      deviceColor(i));
 
-      tft.fillRect(textX, 277, 58, 13, BLACK);
+      tft.fillRect(textX, 266, 58, 12, BLACK);
       tft.setTextSize(1);
 
       if (!remote[i].online) {
         tft.setTextColor(GRAY, BLACK);
-        tft.setCursor(textX, 280);
+        tft.setCursor(textX, 268);
         tft.print("OFFLINE");
       } else if (remote[i].asleep) {
         // Yellow = manual sleep, aqua = automatic proximity sleep.
         tft.setTextColor(remote[i].proximitySleep ? AQUA : YELLOW, BLACK);
-        tft.setCursor(textX, 280);
+        tft.setCursor(textX, 268);
         tft.print("ASLEEP");
       } else {
         tft.setTextColor(GREEN, BLACK);
-        tft.setCursor(textX, 280);
+        tft.setCursor(textX, 268);
         tft.print("ONLINE");
       }
 
@@ -3117,8 +3126,8 @@ void updateMainMenuDynamic(bool force) {
 
 void drawBackArrow() {
   // Visible arrow.
-  tft.fillTriangle(10, 18, 23, 10, 23, 26, WHITE);
-  tft.fillRect(21, 16, 14, 5, WHITE);
+  tft.fillTriangle(10, 38, 23, 30, 23, 46, WHITE);
+  tft.fillRect(21, 36, 14, 5, WHITE);
 }
 
 void drawPeerStatic() {
@@ -3129,12 +3138,12 @@ void drawPeerStatic() {
   tft.drawCircle(PEER_CIRCLE_CENTER_X, PEER_CIRCLE_CENTER_Y,
                  PEER_CIRCLE_RADIUS, WHITE);
 
-  tft.drawLine(11, 248, 231, 248, WHITE);
+  tft.drawLine(11, 251, 231, 251, WHITE);
 
   // Page title: aligned with the back arrow and kept clear of the N marker.
   tft.setTextSize(1);
   tft.setTextColor(WHITE, BLACK);
-  tft.setCursor(42, 12);
+  tft.setCursor(42, 35);
   tft.print("LOCATION");
 
   // Show the two remote devices from this device's point of view.
@@ -3364,11 +3373,11 @@ void updatePeerDynamicText(const String &locationText, bool locationOk,
   }
   String calText = anyCal ? String("DIST CAL") : String("");
   if (calText != lastPeerCalText) {
-    tft.fillRect(150, 8, 88, 12, BLACK);
+    tft.fillRect(150, 32, 88, 12, BLACK);
     if (calText.length()) {
       tft.setTextSize(1);
       tft.setTextColor(LIGHTGREEN, BLACK);
-      tft.setCursor(236 - (int)calText.length() * 6, 10);
+      tft.setCursor(236 - (int)calText.length() * 6, 34);
       tft.print(calText);
     }
     lastPeerCalText = calText;
@@ -3627,7 +3636,7 @@ void processTouch() {
 
   if (currentScreen == MAIN_MENU) {
     // Title bar "LORA THE EXPLORER": hold 3 s for the developer screen.
-    if (screenY < 35) {
+    if (screenY < 56) {
       titleHoldStart = millis();
       return;
     }
@@ -3635,7 +3644,7 @@ void processTouch() {
     // Double-tap the TIME/DATE area to run the packet test.
     static unsigned long lastTimeTap = 0;
     if (screenX >= 20 && screenX < 220 &&
-        screenY >= 35 && screenY < 110) {
+        screenY >= 56 && screenY < 104) {
       if (lastTimeTap && millis() - lastTimeTap <= 500UL) {
         lastTimeTap = 0;
         Serial.println("BUTTON: PACKET TEST (DOUBLE TAP TIME)");
@@ -3649,7 +3658,7 @@ void processTouch() {
 
     // EXACT white rectangle: CHECK LOCATION
     if (screenX >= 22 && screenX < 218 &&
-        screenY >= 136 && screenY < 184) {
+        screenY >= 134 && screenY < 178) {
       Serial.println("BUTTON: CHECK LOCATION");
       drawPeerLocation();
       return;
@@ -3657,7 +3666,7 @@ void processTouch() {
 
     // EXACT white rectangle: SLEEP MODE
     if (screenX >= 22 && screenX < 218 &&
-        screenY >= 191 && screenY < 239) {
+        screenY >= 186 && screenY < 230) {
       Serial.println("BUTTON: SLEEP MODE");
       setSleepMode(!sleepMode);
       updateMainMenuDynamic(true);
@@ -3668,7 +3677,7 @@ void processTouch() {
     int ownIconCenterX = (DEVICE_ID == 1) ? 40 : (DEVICE_ID == 2 ? 120 : 198);
     if (screenX >= ownIconCenterX - 14 &&
         screenX <= ownIconCenterX + 14 &&
-        screenY >= 248 && screenY <= 280) {
+        screenY >= 244 && screenY <= 292) {
       Serial.println("BUTTON: PING ALL (OWN DEVICE ICON)");
       sendPing(0);   // sendPing() already redrew "Sending..."
       return;
@@ -3681,7 +3690,7 @@ void processTouch() {
 
       int cx = targetCenters[targetId];
       if (screenX >= cx - 14 && screenX <= cx + 14 &&
-          screenY >= 248 && screenY <= 280) {
+          screenY >= 244 && screenY <= 292) {
         Serial.print("BUTTON: PING LORA #");
         Serial.println(targetId);
         sendPing(targetId);   // sendPing() already redrew "Sending..."
@@ -3691,7 +3700,7 @@ void processTouch() {
   } else if (currentScreen == PEER_LOCATION_SCREEN) {
     // Larger square hitbox surrounding the arrow only.
     if (screenX >= 0 && screenX <= 42 &&
-        screenY >= 0 && screenY <= 42) {
+        screenY >= 20 && screenY <= 58) {
       Serial.println("BUTTON: BACK ARROW");
       drawMainMenu();
       return;
@@ -3870,7 +3879,8 @@ void fitTouchAxis(const float *x, const float *y, const float *out, int n,
 void runTouchCalibration() {
   const int n = 5;
   const int targetX[n] = {30, 210, 30, 210, 120};
-  const int targetY[n] = {30, 30, 290, 290, 160};
+  // Top crosses at y 50: the enclosure hides the top ~24 px of the screen.
+  const int targetY[n] = {50, 50, 290, 290, 160};
   float rawX[n], rawY[n], outX[n], outY[n];
 
   Serial.println("TOUCH CALIBRATION: release the screen, then tap each cross");
@@ -4564,8 +4574,8 @@ void drawPacketTestClock(bool force) {
   String text = buf;
   if (!force && text == lastText) return;
   lastText = text;
-  tft.fillRect(80, 2, 80, 10, BLACK);
-  drawCenteredText(text, 3, YELLOW, BLACK, 1);
+  tft.fillRect(80, 26, 80, 10, BLACK);
+  drawCenteredText(text, 27, YELLOW, BLACK, 1);
 }
 
 // While the result screen waits for a tap: radio, GPS, heartbeats, clock.
@@ -4630,8 +4640,8 @@ void runPacketTest() {
   memset(packetTestAnswers, 0, sizeof(packetTestAnswers));
 
   tft.fillScreen(BLACK);
-  drawCenteredText("PACKET TEST", 20, WHITE, BLACK, 2);
-  drawCenteredText("Sending " + String(TEST_PACKET_COUNT) + " packets...", 50, YELLOW, BLACK, 1);
+  drawCenteredText("PACKET TEST", 32, WHITE, BLACK, 2);
+  drawCenteredText("Sending " + String(TEST_PACKET_COUNT) + " packets...", 56, YELLOW, BLACK, 1);
 
   unsigned long interval = packetTestInterval();
   Serial.printf("PACKET TEST START device=%d test=%d interval_ms=%lu\n", DEVICE_ID, packetTestId, interval);
@@ -4685,11 +4695,11 @@ void runPacketTest() {
   // ---- Results ----
   tft.fillScreen(BLACK);
   drawPacketTestClock(true);
-  drawCenteredText("PACKET TEST RESULT", 15, WHITE, BLACK, 2);
+  drawCenteredText("PACKET TEST RESULT", 40, WHITE, BLACK, 2);
   drawCenteredText(testPaceSlow ? "Packets received (SLOW pace)" : "Packets received by each device",
-                   34, GRAY, BLACK, 1);
+                   60, GRAY, BLACK, 1);
 
-  int y = 45;
+  int y = 72;
   bool anyAnswer = false;
   for (int id = 1; id <= 3; id++) {
     if (id == DEVICE_ID) continue;
@@ -4741,7 +4751,7 @@ void runPacketTest() {
     drawCenteredText(distText, y + 70, distance < 0 ? GRAY : LOCATION_GREEN, BLACK, 1);
     Serial.println(sum);
 
-    y += 100;
+    y += 92;
   }
 
   if (anyAnswer) {
@@ -4826,7 +4836,7 @@ void drawDeveloperPaceToggle() {
 void runDeveloperScreen() {
   Serial.println("DEVELOPER SCREEN");
   tft.fillScreen(BLACK);
-  drawCenteredText("DEVELOPER", 20, YELLOW, BLACK, 2);
+  drawCenteredText("DEVELOPER", 30, YELLOW, BLACK, 2);
   drawCenteredText("Proximity sleep (10 m)", 56, WHITE, BLACK, 1);
   drawDeveloperToggle();
   drawCenteredText("Packet test pace (this device)", 141, WHITE, BLACK, 1);
